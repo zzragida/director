@@ -117,6 +117,15 @@ class ReasoningEngine:
         """
         self.agents.extend(agents)
 
+    def get_outcome_status(self):
+        """Return the top-level message status for the current reasoning run.
+
+        Any failed agent makes the overall run non-successful. A distinct partial
+        status is intentionally not introduced here because message status is a
+        public contract consumed by the chat frontend.
+        """
+        return MsgStatus.error if self.failed_agents else MsgStatus.success
+
     def build_context(self):
         """Build the context for the reasoning engine it adds the information about the video or collection to the reasoning context."""
         input_context = ContextMessage(
@@ -190,6 +199,13 @@ class ReasoningEngine:
         agent = next(
             (agent for agent in self.agents if agent.agent_name == agent_name), None
         )
+        if agent is None:
+            error_message = f"Unknown agent requested: {agent_name}"
+            logger.error(error_message)
+            self.output_message.actions.append(error_message)
+            self.output_message.push_update()
+            return AgentResponse(status=AgentStatus.ERROR, message=error_message)
+
         self.output_message.actions.append(f"Running @{agent_name} agent")
         self.output_message.agents.append(agent_name)
         self.output_message.push_update()
@@ -289,7 +305,7 @@ class ReasoningEngine:
                     # Direct response case
                     self.summary_content.status_message = "Here is the response"
                     self.summary_content.text = llm_response.content
-                    self.summary_content.status = MsgStatus.success
+                    self.summary_content.status = self.get_outcome_status()
                 else:
                     self.session.reasoning_context.append(
                         ContextMessage(
@@ -307,12 +323,9 @@ class ReasoningEngine:
                     )
                     self.session.reasoning_context.pop()
                     self.summary_content.text = summary_response.content
-                    if self.failed_agents:
-                        self.summary_content.status = MsgStatus.error
-                    else:
-                        self.summary_content.status = MsgStatus.success
+                    self.summary_content.status = self.get_outcome_status()
                     self.summary_content.status_message = "Final Cut"
-                self.output_message.status = MsgStatus.success
+                self.output_message.status = self.get_outcome_status()
                 self.output_message.publish()
                 print("-" * 40, "Stopping", "-" * 40)
                 self.stop()
