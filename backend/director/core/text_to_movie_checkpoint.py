@@ -6,6 +6,12 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from director.core.context_cas import atomic_update_context
+from director.core.generation_budget import (
+    BudgetConfigurationError,
+    BudgetGuardViolation,
+    authorize_checkpoint_budget_transition,
+    load_budget_configuration_from_env,
+)
 from director.core.generation_lease import (
     GenerationLease,
     get_active_fencing_lease,
@@ -314,6 +320,55 @@ class TextToMovieCheckpointStore:
             return checkpoint.audio_operation.provider
         return None
 
+    @staticmethod
+    def _raw_submission_count(operation: Optional[Dict[str, Any]]) -> int:
+        if not isinstance(operation, dict):
+            return 0
+        value = operation.get("submission_count")
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    @classmethod
+    def _has_new_submission(
+        cls,
+        raw_checkpoint: Optional[Dict[str, Any]],
+        checkpoint: TextToMovieCheckpoint,
+    ) -> bool:
+        raw_checkpoint = raw_checkpoint if isinstance(raw_checkpoint, dict) else {}
+        old_scenes = {
+            scene.get("index"): scene
+            for scene in raw_checkpoint.get("scenes", []) or []
+            if isinstance(scene, dict)
+        }
+        for scene in checkpoint.scenes:
+            operation = scene.operation
+            if operation is None or operation.submission_count is None:
+                continue
+            old_scene = old_scenes.get(scene.index) or {}
+            old_count = cls._raw_submission_count(old_scene.get("operation"))
+            if int(operation.submission_count) > old_count:
+                return True
+
+        operation = checkpoint.audio_operation
+        if operation is not None and operation.submission_count is not None:
+            old_count = cls._raw_submission_count(raw_checkpoint.get("audio_operation"))
+            if int(operation.submission_count) > old_count:
+                return True
+        return False
+
+    @staticmethod
+    def _restore_checkpoint(
+        checkpoint: TextToMovieCheckpoint,
+        raw_checkpoint: Optional[Dict[str, Any]],
+    ) -> None:
+        if not isinstance(raw_checkpoint, dict):
+            return
+        try:
+            restored = TextToMovieCheckpoint.model_validate(raw_checkpoint)
+        except Exception:
+            return
+        for field_name in TextToMovieCheckpoint.model_fields:
+            setattr(checkpoint, field_name, getattr(restored, field_name))
+
     def _active_text_to_movie_arguments(self) -> Optional[Dict[str, Any]]:
         state = getattr(self.session, "state", None)
         if not isinstance(state, dict):
@@ -397,9 +452,11 @@ class TextToMovieCheckpointStore:
         message_holder = {}
         conflict_reason = None
         fence_reason = None
+        budget_error = None
+        budget_restore_raw = None
 
         def mutate(context: Dict) -> Optional[Dict]:
-            nonlocal conflict_reason, fence_reason
+            nonlocal conflict_reason, fence_reason, budget_error, budget_restore_raw
             if effective_lease is not None:
                 fence_reason = validate_fencing_lease_in_context(
                     context,
@@ -420,6 +477,23 @@ class TextToMovieCheckpointStore:
                 current_revision = int(raw_current.get("revision", 0))
                 if current_revision != expected_revision:
                     conflict_reason = "checkpoint_revision_conflict"
+                    return None
+
+            if self._has_new_submission(raw_current, checkpoint):
+                try:
+                    policy, rate_card = load_budget_configuration_from_env()
+                    if policy is not None:
+                        authorize_checkpoint_budget_transition(
+                            context=context,
+                            previous_checkpoint=raw_current,
+                            checkpoint=checkpoint,
+                            policy=policy,
+                            rate_card=rate_card,
+                            now_epoch=self._authoritative_now(),
+                        )
+                except (BudgetConfigurationError, BudgetGuardViolation) as exc:
+                    budget_error = exc
+                    budget_restore_raw = raw_current
                     return None
 
             document[checkpoint.checkpoint_id] = stored.model_dump(mode="json")
@@ -445,6 +519,24 @@ class TextToMovieCheckpointStore:
             raise CheckpointFenceError(fence_reason)
         if conflict_reason:
             raise CheckpointConflictError(conflict_reason)
+        if budget_error is not None:
+            self._restore_checkpoint(checkpoint, budget_restore_raw)
+            if isinstance(budget_error, BudgetGuardViolation):
+                code = budget_error.code
+                operation_id = budget_error.operation_id
+                scene_index = budget_error.scene_index
+            else:
+                code = str(budget_error)
+                operation_id = None
+                scene_index = None
+            raise TextToMovieExecutionError(
+                stage="budget",
+                code=code,
+                message="Generation budget guard blocked a new provider submission.",
+                scene_index=scene_index,
+                resumable=True,
+                operation_id=operation_id,
+            )
 
         checkpoint.revision = next_revision
         checkpoint.version = CHECKPOINT_VERSION

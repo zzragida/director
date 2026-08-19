@@ -18,6 +18,8 @@ on:
       - "backend/director/core/generation_lease.py"
       - "backend/director/core/generation_provenance.py"
       - "backend/director/core/generation_cost.py"
+      - "backend/director/core/generation_billing.py"
+      - "backend/director/core/generation_budget.py"
       - "backend/director/core/provenance_export.py"
       - "backend/director/tools/kling.py"
       - "backend/director/tools/stabilityai.py"
@@ -52,6 +54,8 @@ on:
       - "backend/director/core/generation_lease.py"
       - "backend/director/core/generation_provenance.py"
       - "backend/director/core/generation_cost.py"
+      - "backend/director/core/generation_billing.py"
+      - "backend/director/core/generation_budget.py"
       - "backend/director/core/provenance_export.py"
       - "backend/director/tools/kling.py"
       - "backend/director/tools/stabilityai.py"
@@ -102,6 +106,8 @@ jobs:
           backend/director/core/generation_lease.py
           backend/director/core/generation_provenance.py
           backend/director/core/generation_cost.py
+          backend/director/core/generation_billing.py
+          backend/director/core/generation_budget.py
           backend/director/core/provenance_export.py
           backend/director/core/text_to_movie_checkpoint.py
           backend/director/tools/kling.py
@@ -130,6 +136,8 @@ jobs:
           backend/tests/core/test_generation_lease.py
           backend/tests/core/test_generation_provenance.py
           backend/tests/core/test_generation_cost.py
+          backend/tests/core/test_generation_billing.py
+          backend/tests/core/test_generation_budget.py
           backend/tests/core/test_provenance_export.py
           backend/tests/agents/test_base_agent_tool_contract.py
           backend/tests/agents/test_agent_failure_contract.py
@@ -138,5 +146,6 @@ jobs:
           backend/tests/agents/test_text_to_movie_provider_reconciliation.py
           backend/tests/agents/test_text_to_movie_orphan_reconciliation.py
           backend/tests/agents/test_text_to_movie_generation_lease.py
+          backend/tests/agents/test_text_to_movie_budget_guard.py
           backend/tests/handler/test_chat_agent_selection_contract.py
           backend/tests/entrypoint/test_chat_socket_contract.py
