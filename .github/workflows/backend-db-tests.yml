@@ -5,8 +5,13 @@ on:
     paths:
       - "backend/director/db/**"
       - "backend/director/core/reasoning.py"
+      - "backend/director/agents/summarize_video.py"
+      - "backend/director/agents/upload.py"
+      - "backend/director/handler.py"
       - "backend/tests/db/**"
       - "backend/tests/core/**"
+      - "backend/tests/agents/**"
+      - "backend/tests/handler/**"
       - ".github/workflows/backend-db-tests.yml"
   push:
     branches:
@@ -14,8 +19,13 @@ on:
     paths:
       - "backend/director/db/**"
       - "backend/director/core/reasoning.py"
+      - "backend/director/agents/summarize_video.py"
+      - "backend/director/agents/upload.py"
+      - "backend/director/handler.py"
       - "backend/tests/db/**"
       - "backend/tests/core/**"
+      - "backend/tests/agents/**"
+      - "backend/tests/handler/**"
       - ".github/workflows/backend-db-tests.yml"
 
 permissions:
@@ -45,3 +55,5 @@ jobs:
           pytest -q
           backend/tests/db/test_session_delete_contract.py
           backend/tests/core/test_reasoning_outcome_contract.py
+          backend/tests/agents/test_agent_failure_contract.py
+          backend/tests/handler/test_chat_agent_selection_contract.py
