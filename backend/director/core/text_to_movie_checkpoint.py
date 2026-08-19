@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from director.core.context_cas import atomic_update_context
 from director.core.generation_lease import (
     GenerationLease,
+    get_active_fencing_lease,
     validate_fencing_lease_in_context,
 )
 from director.core.generation_lifecycle import (
@@ -273,6 +274,7 @@ class TextToMovieCheckpointStore:
         *,
         fencing_lease: Optional[GenerationLease] = None,
     ) -> None:
+        effective_lease = fencing_lease or get_active_fencing_lease(self.session)
         expected_revision = checkpoint.revision
         next_revision = expected_revision + 1
         stored = checkpoint.model_copy(deep=True)
@@ -284,10 +286,10 @@ class TextToMovieCheckpointStore:
 
         def mutate(context: Dict) -> Optional[Dict]:
             nonlocal conflict_reason, fence_reason
-            if fencing_lease is not None:
+            if effective_lease is not None:
                 fence_reason = validate_fencing_lease_in_context(
                     context,
-                    fencing_lease,
+                    effective_lease,
                     now_epoch=self._authoritative_now(),
                 )
                 if fence_reason is not None:
