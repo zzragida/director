@@ -16,11 +16,16 @@ from director.core.generation_lifecycle import (
     create_operation,
     make_generation_run_id,
 )
+from director.core.generation_provenance import (
+    GenerationProvenanceManifest,
+    create_provenance_manifest,
+    sync_provenance_manifest,
+)
 from director.core.session import ContextMessage, RoleTypes
 
 
 CHECKPOINT_CONTEXT_KEY = "__text_to_movie_checkpoints__"
-CHECKPOINT_VERSION = 5
+CHECKPOINT_VERSION = 6
 
 
 class CheckpointConflictError(RuntimeError):
@@ -88,6 +93,7 @@ class TextToMovieCheckpoint(BaseModel):
     failure_stage: Optional[str] = None
     failure_code: Optional[str] = None
     failed_scene_index: Optional[int] = None
+    provenance: Optional[GenerationProvenanceManifest] = None
 
     @property
     def completed_scene_count(self) -> int:
@@ -127,6 +133,16 @@ class TextToMovieCheckpoint(BaseModel):
                 self.audio_operation.artifact = dict(self.audio_media)
                 self.audio_operation.state = "persisted"
                 self.audio_operation.recoverable = False
+            changed = True
+
+        if self.provenance is None:
+            self.provenance = create_provenance_manifest(
+                generation_run_id=self.generation_run_id,
+                checkpoint_id=self.checkpoint_id,
+                request_fingerprint=self.request_fingerprint,
+                video_provider=video_provider,
+                audio_provider=audio_provider,
+            )
             changed = True
 
         if self.version != CHECKPOINT_VERSION:
@@ -187,6 +203,10 @@ def create_checkpoint(
     scenes: List[Dict[str, Any]],
     video_provider: Optional[str] = None,
     audio_provider: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    storyline: Optional[str] = None,
+    video_config: Optional[Dict[str, Any]] = None,
+    audio_config: Optional[Dict[str, Any]] = None,
 ) -> TextToMovieCheckpoint:
     checkpoint = TextToMovieCheckpoint(
         checkpoint_id=make_checkpoint_id(request_fingerprint),
@@ -203,6 +223,18 @@ def create_checkpoint(
             video_provider=video_provider,
             audio_provider=audio_provider,
         )
+        checkpoint.provenance = create_provenance_manifest(
+            generation_run_id=checkpoint.generation_run_id,
+            checkpoint_id=checkpoint.checkpoint_id,
+            request_fingerprint=request_fingerprint,
+            collection_id=collection_id,
+            storyline=storyline,
+            video_provider=video_provider,
+            audio_provider=audio_provider,
+            video_config=video_config,
+            audio_config=audio_config,
+        )
+        sync_provenance_manifest(checkpoint.provenance, checkpoint)
     return checkpoint
 
 
@@ -268,12 +300,39 @@ class TextToMovieCheckpointStore:
         except Exception:
             return None
 
+    @staticmethod
+    def _infer_provider(checkpoint: TextToMovieCheckpoint, media_type: str) -> Optional[str]:
+        if media_type == "video":
+            for scene in checkpoint.scenes:
+                if scene.operation is not None and scene.operation.provider:
+                    return scene.operation.provider
+            return None
+        if checkpoint.audio_operation is not None:
+            return checkpoint.audio_operation.provider
+        return None
+
+    def _sync_provenance(self, checkpoint: TextToMovieCheckpoint) -> None:
+        if not checkpoint.generation_run_id:
+            checkpoint.generation_run_id = make_generation_run_id(
+                checkpoint.request_fingerprint
+            )
+        if checkpoint.provenance is None:
+            checkpoint.provenance = create_provenance_manifest(
+                generation_run_id=checkpoint.generation_run_id,
+                checkpoint_id=checkpoint.checkpoint_id,
+                request_fingerprint=checkpoint.request_fingerprint,
+                video_provider=self._infer_provider(checkpoint, "video"),
+                audio_provider=self._infer_provider(checkpoint, "audio"),
+            )
+        sync_provenance_manifest(checkpoint.provenance, checkpoint)
+
     def save(
         self,
         checkpoint: TextToMovieCheckpoint,
         *,
         fencing_lease: Optional[GenerationLease] = None,
     ) -> None:
+        self._sync_provenance(checkpoint)
         effective_lease = fencing_lease or get_active_fencing_lease(self.session)
         expected_revision = checkpoint.revision
         next_revision = expected_revision + 1
