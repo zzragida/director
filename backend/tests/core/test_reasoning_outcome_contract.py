@@ -107,8 +107,10 @@ class FakeAgent:
     def __init__(self, agent_name, response_status):
         self.agent_name = agent_name
         self.response_status = response_status
+        self.call_count = 0
 
     def safe_call(self, *args, **kwargs):
+        self.call_count += 1
         return AgentResponse(status=self.response_status, message=self.agent_name)
 
     def to_llm_format(self):
@@ -210,6 +212,38 @@ def test_unknown_tool_returns_typed_error_instead_of_crashing(monkeypatch):
     assert session.output_message.push_count == 1
 
 
+def test_non_object_tool_arguments_are_rejected_before_agent_call(monkeypatch):
+    reasoning = load_reasoning_module(monkeypatch)
+    engine, _ = make_engine(reasoning)
+    agent = FakeAgent("known_agent", AgentStatus.SUCCESS)
+    engine.register_agents([agent])
+
+    agent_name, response = engine.run_tool_call(
+        {
+            "id": "call-invalid",
+            "tool": {"name": "known_agent", "arguments": ["not", "an", "object"]},
+        }
+    )
+
+    assert agent_name == "known_agent"
+    assert response.status == AgentStatus.ERROR
+    assert response.data["error"] == "invalid_tool_arguments"
+    assert response.data["details"][0]["field"] == "$"
+    assert agent.call_count == 0
+
+
+def test_malformed_tool_envelope_returns_typed_error(monkeypatch):
+    reasoning = load_reasoning_module(monkeypatch)
+    engine, _ = make_engine(reasoning)
+
+    agent_name, response = engine.run_tool_call({"id": "call-invalid", "tool": "bad"})
+
+    assert agent_name == "invalid_tool_call"
+    assert response.status == AgentStatus.ERROR
+    assert response.data["error"] == "invalid_tool_call"
+    assert response.data["details"][0]["field"] == "tool"
+
+
 def test_multi_agent_failure_marks_summary_and_output_as_error(monkeypatch):
     reasoning = load_reasoning_module(monkeypatch)
     engine, session = make_engine(reasoning)
@@ -245,6 +279,35 @@ def test_multi_agent_failure_marks_summary_and_output_as_error(monkeypatch):
     assert session.output_message.status == MsgStatus.error
     assert engine.summary_content.status == MsgStatus.error
     assert session.output_message.publish_count == 1
+
+
+def test_malformed_tool_arguments_mark_reasoning_outcome_error(monkeypatch):
+    reasoning = load_reasoning_module(monkeypatch)
+    engine, session = make_engine(reasoning)
+    agent = FakeAgent("known_agent", AgentStatus.SUCCESS)
+    engine.register_agents([agent])
+    engine.iterations = engine.max_iterations - 1
+    engine.llm = FakeLLM(
+        [
+            FakeLLMResponse(
+                content="done",
+                finish_reason="stop",
+                tool_calls=[
+                    {
+                        "id": "call-invalid",
+                        "tool": {"name": "known_agent", "arguments": "bad"},
+                    }
+                ],
+            )
+        ]
+    )
+
+    engine.step()
+
+    assert engine.failed_agents == ["known_agent"]
+    assert agent.call_count == 0
+    assert session.output_message.status == MsgStatus.error
+    assert engine.summary_content.status == MsgStatus.error
 
 
 def test_all_successful_agents_keep_output_success(monkeypatch):
