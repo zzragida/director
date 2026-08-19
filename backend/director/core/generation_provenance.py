@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from director.core.generation_lifecycle import make_operation_id
 
 
-PROVENANCE_VERSION = 1
+PROVENANCE_VERSION = 2
 _REDACTED = "[REDACTED]"
 _SENSITIVE_KEYS = {
     "api_key",
@@ -78,8 +78,12 @@ class SceneArtifactProvenance(BaseModel):
     provider: Optional[str] = None
     operation_state: Optional[str] = None
     attempt_count: int = Field(default=0, ge=0)
+    submission_count: Optional[int] = Field(default=None, ge=0)
+    resume_count: Optional[int] = Field(default=None, ge=0)
+    accounting_complete: bool = False
     provider_request_id: Optional[str] = None
     plan_digest: str
+    planned_duration_seconds: Optional[float] = Field(default=None, ge=0)
     prompt: Optional[str] = None
     prompt_digest: Optional[str] = None
     provider_config: Dict[str, Any] = Field(default_factory=dict)
@@ -95,6 +99,9 @@ class AudioArtifactProvenance(BaseModel):
     provider: Optional[str] = None
     operation_state: Optional[str] = None
     attempt_count: int = Field(default=0, ge=0)
+    submission_count: Optional[int] = Field(default=None, ge=0)
+    resume_count: Optional[int] = Field(default=None, ge=0)
+    accounting_complete: bool = False
     provider_request_id: Optional[str] = None
     prompt: Optional[str] = None
     prompt_digest: Optional[str] = None
@@ -176,6 +183,9 @@ def _operation_fields(operation: Any) -> Dict[str, Any]:
             "provider": None,
             "operation_state": None,
             "attempt_count": 0,
+            "submission_count": None,
+            "resume_count": None,
+            "accounting_complete": False,
             "provider_request_id": None,
         }
     return {
@@ -183,8 +193,22 @@ def _operation_fields(operation: Any) -> Dict[str, Any]:
         "provider": getattr(operation, "provider", None),
         "operation_state": str(getattr(operation, "state", "")) or None,
         "attempt_count": int(getattr(operation, "attempt_count", 0) or 0),
+        "submission_count": getattr(operation, "submission_count", None),
+        "resume_count": getattr(operation, "resume_count", None),
+        "accounting_complete": bool(getattr(operation, "accounting_complete", False)),
         "provider_request_id": getattr(operation, "provider_request_id", None),
     }
+
+
+def _planned_duration(plan: Any) -> Optional[float]:
+    if not isinstance(plan, dict):
+        return None
+    value = plan.get("suggested_duration")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0:
+        return None
+    return float(value)
 
 
 def sync_provenance_manifest(
@@ -199,10 +223,12 @@ def sync_provenance_manifest(
         media = getattr(scene, "media", None) or {}
         prompt = getattr(scene, "prompt", None)
         operation = getattr(scene, "operation", None)
+        plan = getattr(scene, "plan", {}) or {}
         scene_entries.append(
             SceneArtifactProvenance(
                 index=int(getattr(scene, "index", 0)),
-                plan_digest=stable_digest(getattr(scene, "plan", {}) or {}),
+                plan_digest=stable_digest(plan),
+                planned_duration_seconds=_planned_duration(plan),
                 prompt=prompt,
                 prompt_digest=stable_digest(prompt) if prompt else None,
                 provider_config=video_config,
