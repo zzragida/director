@@ -138,3 +138,84 @@ def test_scene_lease_allows_only_one_worker_to_submit_provider_work(monkeypatch)
     assert persisted.scenes[0].status == "complete"
     assert persisted.scenes[0].media["id"] == "scene-1"
     assert persisted.status == "complete"
+
+
+def test_late_provider_result_is_fenced_after_another_worker_takes_over(monkeypatch):
+    helper = load_checkpoint_test_helpers()
+    helper.reset_scripts()
+    monkeypatch.setenv("GENERATION_LEASE_TTL_SECONDS", "30")
+    module = helper.load_text_to_movie_module(monkeypatch)
+
+    class ClockedFakeDB(helper.FakeDB):
+        def __init__(self):
+            super().__init__()
+            self.now = 1000
+
+        def current_epoch(self):
+            return self.now
+
+    db = ClockedFakeDB()
+    fingerprint = request_fingerprint(module)
+    checkpoint = module.create_checkpoint(
+        request_fingerprint=fingerprint,
+        visual_style=json.loads(helper.valid_visual_style()),
+        scenes=json.loads(helper.valid_scene_sequence())["scenes"],
+        video_provider="videodb",
+        audio_provider="videodb",
+    )
+    checkpoint.status = "generating"
+    first_scene = checkpoint.scenes[0]
+    first_scene.prompt = "existing scene prompt"
+
+    for index, scene in enumerate(checkpoint.scenes[1:], start=2):
+        media = {"id": f"scene-{index}", "length": 5}
+        scene.media = media
+        scene.status = "complete"
+        scene.operation.state = "persisted"
+        scene.operation.artifact = dict(media)
+        scene.operation.recoverable = False
+
+    checkpoint.audio_media = {"id": "audio-1", "length": 14}
+    checkpoint.audio_operation.state = "persisted"
+    checkpoint.audio_operation.artifact = dict(checkpoint.audio_media)
+    checkpoint.audio_operation.recoverable = False
+
+    store = module.TextToMovieCheckpointStore(helper.FakeSession(db))
+    store.save(checkpoint)
+    operation_id = first_scene.operation.operation_id
+    takeover_holder = {}
+
+    def provider_returns_after_takeover(self, *args, **kwargs):
+        helper.FakeVideoGenerationTool.total_calls += 1
+        db.now = 1031
+        takeover_store = module.GenerationLeaseStore(helper.FakeSession(db))
+        takeover = takeover_store.acquire(
+            operation_id,
+            owner_id="worker-new",
+            ttl_seconds=30,
+        )
+        assert takeover.acquired is True
+        assert takeover.lease.fencing_token >= 2
+        takeover_holder["lease"] = takeover.lease
+        return {"id": "late-scene-result", "length": 4}
+
+    monkeypatch.setattr(
+        helper.FakeVideoGenerationTool,
+        "text_to_video",
+        provider_returns_after_takeover,
+    )
+
+    old_worker, _ = helper.make_agent(module, db, helper.FakeLLM([]))
+    response = run_request(old_worker)
+
+    assert response.status == helper.AgentStatus.ERROR
+    assert response.data["stage"] == "concurrency"
+    assert response.data["code"] == "operation_lease_lost"
+    assert response.data["operation_id"] == operation_id
+    assert helper.FakeVideoGenerationTool.total_calls == 1
+    assert takeover_holder["lease"].fencing_token >= 2
+
+    persisted = store.get(checkpoint.checkpoint_id)
+    assert persisted.scenes[0].media is None
+    assert persisted.scenes[0].status != "complete"
+    assert persisted.scenes[0].operation.state == "submitting"

@@ -106,6 +106,7 @@ jobs:
           pytest -q
           backend/tests/db/test_session_delete_contract.py
           backend/tests/db/test_context_cas_contract.py
+          backend/tests/db/test_db_time_contract.py
           backend/tests/core/test_session_context_cas.py
           backend/tests/core/test_reasoning_outcome_contract.py
           backend/tests/core/test_chat_request_contract.py

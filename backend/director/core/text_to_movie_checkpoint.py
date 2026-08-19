@@ -1,10 +1,16 @@
 import hashlib
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from director.core.context_cas import atomic_update_context
+from director.core.generation_lease import (
+    GenerationLease,
+    get_active_fencing_lease,
+    validate_fencing_lease_in_context,
+)
 from director.core.generation_lifecycle import (
     GenerationOperation,
     create_operation,
@@ -14,11 +20,19 @@ from director.core.session import ContextMessage, RoleTypes
 
 
 CHECKPOINT_CONTEXT_KEY = "__text_to_movie_checkpoints__"
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 5
 
 
 class CheckpointConflictError(RuntimeError):
     """Raised when a stale checkpoint attempts to overwrite newer progress."""
+
+
+class CheckpointFenceError(CheckpointConflictError):
+    """Raised when a checkpoint writer no longer owns the current fence."""
+
+    def __init__(self, reason_code: str):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
 
 
 class TextToMovieExecutionError(RuntimeError):
@@ -236,6 +250,15 @@ class TextToMovieCheckpointStore:
         context = self.session.db.get_context_messages(self.session.session_id) or {}
         return self._read_document_from_context(context)
 
+    def _authoritative_now(self) -> int:
+        current_epoch = getattr(self.session.db, "current_epoch", None)
+        if callable(current_epoch):
+            try:
+                return int(current_epoch())
+            except (AttributeError, NotImplementedError):
+                pass
+        return int(time.time())
+
     def get(self, checkpoint_id: str) -> Optional[TextToMovieCheckpoint]:
         raw = self._read_document().get(checkpoint_id)
         if raw is None:
@@ -245,7 +268,13 @@ class TextToMovieCheckpointStore:
         except Exception:
             return None
 
-    def save(self, checkpoint: TextToMovieCheckpoint) -> None:
+    def save(
+        self,
+        checkpoint: TextToMovieCheckpoint,
+        *,
+        fencing_lease: Optional[GenerationLease] = None,
+    ) -> None:
+        effective_lease = fencing_lease or get_active_fencing_lease(self.session)
         expected_revision = checkpoint.revision
         next_revision = expected_revision + 1
         stored = checkpoint.model_copy(deep=True)
@@ -253,9 +282,19 @@ class TextToMovieCheckpointStore:
         stored.version = CHECKPOINT_VERSION
         message_holder = {}
         conflict_reason = None
+        fence_reason = None
 
         def mutate(context: Dict) -> Optional[Dict]:
-            nonlocal conflict_reason
+            nonlocal conflict_reason, fence_reason
+            if effective_lease is not None:
+                fence_reason = validate_fencing_lease_in_context(
+                    context,
+                    effective_lease,
+                    now_epoch=self._authoritative_now(),
+                )
+                if fence_reason is not None:
+                    return None
+
             document = self._read_document_from_context(context)
             raw_current = document.get(checkpoint.checkpoint_id)
 
@@ -288,6 +327,8 @@ class TextToMovieCheckpointStore:
             max_attempts=self.max_cas_attempts,
         )
 
+        if fence_reason:
+            raise CheckpointFenceError(fence_reason)
         if conflict_reason:
             raise CheckpointConflictError(conflict_reason)
 
