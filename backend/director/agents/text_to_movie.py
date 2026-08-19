@@ -1,3 +1,4 @@
+import inspect
 import json
 import logging
 import os
@@ -9,11 +10,19 @@ from videodb.asset import AudioAsset, VideoAsset
 
 from director.agents.base import AgentResponse, AgentStatus, BaseAgent
 from director.constants import DOWNLOADS_PATH
+from director.core.generation_lease import (
+    GenerationLeaseLostError,
+    GenerationLeaseStore,
+    make_lease_owner_id,
+    safe_lease_summary,
+)
 from director.core.generation_lifecycle import (
     GenerationOperationState,
     begin_resume,
     begin_submission,
     make_artifact_name,
+    make_generation_run_id,
+    make_operation_id,
     record_failure,
     record_materialized,
     record_persisted,
@@ -33,6 +42,7 @@ from director.core.session import (
     VideoData,
 )
 from director.core.text_to_movie_checkpoint import (
+    CheckpointConflictError,
     TextToMovieCheckpoint,
     TextToMovieCheckpointStore,
     TextToMovieExecutionError,
@@ -163,6 +173,8 @@ class TextToMovieAgent(BaseAgent):
         video_content = None
         checkpoint = None
         checkpoint_store = TextToMovieCheckpointStore(self.session)
+        self.generation_lease_store = GenerationLeaseStore(self.session)
+        self.generation_lease_owner_id = make_lease_owner_id()
 
         try:
             raw_storyline = self._validate_input(job_type, text_to_movie)
@@ -189,9 +201,8 @@ class TextToMovieAgent(BaseAgent):
                 video_config=video_gen_config,
                 audio_config=audio_gen_config,
             )
-            checkpoint = checkpoint_store.get(
-                make_checkpoint_id(request_fingerprint)
-            )
+            checkpoint_id = make_checkpoint_id(request_fingerprint)
+            checkpoint = checkpoint_store.get(checkpoint_id)
 
             self.output_message.actions.append("Processing input...")
             video_content = VideoContent(
@@ -207,36 +218,27 @@ class TextToMovieAgent(BaseAgent):
                 and checkpoint.status == "complete"
                 and checkpoint.final_video
             ):
-                return self._completed_checkpoint_response(
-                    checkpoint,
-                    video_content,
-                )
+                return self._completed_checkpoint_response(checkpoint, video_content)
 
             self._validate_provider_configuration(engine, audio_engine)
 
             if checkpoint is None:
-                visual_style = self.generate_visual_style(raw_storyline)
-                scenes = self.generate_scene_sequence(
-                    raw_storyline,
-                    visual_style,
-                    engine,
-                )
-                checkpoint = create_checkpoint(
+                checkpoint = self._plan_checkpoint_with_lease(
+                    checkpoint_store=checkpoint_store,
+                    checkpoint_id=checkpoint_id,
                     request_fingerprint=request_fingerprint,
-                    visual_style=visual_style.model_dump(mode="json"),
-                    scenes=scenes,
-                    video_provider=engine,
-                    audio_provider=audio_engine,
+                    storyline=raw_storyline,
+                    engine=engine,
+                    audio_engine=audio_engine,
                 )
+
+            visual_style = VisualStyle.model_validate(checkpoint.visual_style)
+            scenes = [dict(scene.plan) for scene in checkpoint.scenes]
+            if checkpoint.ensure_lifecycle(
+                video_provider=engine,
+                audio_provider=audio_engine,
+            ):
                 checkpoint_store.save(checkpoint)
-            else:
-                visual_style = VisualStyle.model_validate(checkpoint.visual_style)
-                scenes = [dict(scene.plan) for scene in checkpoint.scenes]
-                if checkpoint.ensure_lifecycle(
-                    video_provider=engine,
-                    audio_provider=audio_engine,
-                ):
-                    checkpoint_store.save(checkpoint)
 
             self._initialize_media_tools(collection_id, engine, audio_engine)
             total_duration = self._resume_or_generate_scenes(
@@ -255,23 +257,12 @@ class TextToMovieAgent(BaseAgent):
                 audio_gen_config=audio_gen_config,
             )
 
-            self.output_message.actions.append("Combining assets into final video...")
-            self.output_message.push_update()
-            try:
-                final_video = self.combine_assets(scenes, sound_effects_media)
-            except Exception as exc:
-                raise TextToMovieExecutionError(
-                    stage="combine",
-                    code="combine_failed",
-                    message="Unable to combine generated assets.",
-                ) from exc
-
-            checkpoint.status = "complete"
-            checkpoint.final_video = final_video
-            checkpoint.failure_stage = None
-            checkpoint.failure_code = None
-            checkpoint.failed_scene_index = None
-            checkpoint_store.save(checkpoint)
+            final_video = self._combine_with_lease(
+                checkpoint=checkpoint,
+                checkpoint_store=checkpoint_store,
+                scenes=scenes,
+                audio_media=sound_effects_media,
+            )
 
             video_content.video = VideoData(stream_url=final_video)
             video_content.status = MsgStatus.success
@@ -292,6 +283,30 @@ class TextToMovieAgent(BaseAgent):
                 },
             )
 
+        except CheckpointConflictError:
+            logger.warning("Text-to-movie checkpoint changed concurrently")
+            if video_content is not None:
+                video_content.status = MsgStatus.error
+                video_content.status_message = "Movie generation changed in another worker"
+                self.output_message.publish()
+            return AgentResponse(
+                status=AgentStatus.ERROR,
+                message="Movie generation changed concurrently; retry from the latest checkpoint.",
+                data={
+                    "error": "generation_concurrency_conflict",
+                    "stage": "concurrency",
+                    "code": "checkpoint_conflict",
+                    "resumable": True,
+                    **(
+                        {
+                            "checkpoint_id": checkpoint.checkpoint_id,
+                            "generation_run_id": checkpoint.generation_run_id,
+                        }
+                        if checkpoint is not None
+                        else {}
+                    ),
+                },
+            )
         except StructuredGenerationError as error:
             logger.warning(
                 "Structured text-to-movie generation failed at %s: %s",
@@ -318,20 +333,24 @@ class TextToMovieAgent(BaseAgent):
                 error.stage,
                 error.code,
             )
-            if checkpoint is not None:
+            if checkpoint is not None and error.stage != "concurrency":
                 checkpoint.status = "failed"
                 checkpoint.failure_stage = error.stage
                 checkpoint.failure_code = error.code
                 checkpoint.failed_scene_index = error.scene_index
-                checkpoint_store.save(checkpoint)
+                try:
+                    checkpoint_store.save(checkpoint)
+                except CheckpointConflictError:
+                    logger.info("Skipped stale failure checkpoint after concurrent update")
 
             if video_content is not None:
                 video_content.status = MsgStatus.error
-                video_content.status_message = (
-                    "Movie generation requires reconciliation"
-                    if error.stage == "reconciliation"
-                    else "Movie generation paused and can be resumed"
-                )
+                if error.stage == "concurrency":
+                    video_content.status_message = "Movie generation is already active elsewhere"
+                elif error.stage == "reconciliation":
+                    video_content.status_message = "Movie generation requires reconciliation"
+                else:
+                    video_content.status_message = "Movie generation paused and can be resumed"
                 self.output_message.publish()
 
             data = {
@@ -339,9 +358,7 @@ class TextToMovieAgent(BaseAgent):
                 "stage": error.stage,
                 "code": error.code,
                 "resumable": bool(error.resumable and checkpoint is not None),
-                "completed_scenes": (
-                    checkpoint.completed_scene_count if checkpoint else 0
-                ),
+                "completed_scenes": checkpoint.completed_scene_count if checkpoint else 0,
                 "total_scenes": len(checkpoint.scenes) if checkpoint else 0,
             }
             if checkpoint is not None:
@@ -357,7 +374,9 @@ class TextToMovieAgent(BaseAgent):
             return AgentResponse(
                 status=AgentStatus.ERROR,
                 message=(
-                    "Movie generation is paused for reconciliation."
+                    "Movie generation is already running in another worker."
+                    if error.stage == "concurrency"
+                    else "Movie generation is paused for reconciliation."
                     if error.stage == "reconciliation"
                     else "Movie generation paused after a recoverable pipeline failure."
                 ),
@@ -476,18 +495,132 @@ class TextToMovieAgent(BaseAgent):
                 secret_key=os.getenv("KLING_AI_SECRET_API_KEY"),
             )
         else:
-            self.video_gen_tool = VDBVideoGenerationTool(
-                collection_id=collection_id
-            )
+            self.video_gen_tool = VDBVideoGenerationTool(collection_id=collection_id)
 
         if audio_engine == "elevenlabs":
             self.audio_gen_tool = ElevenLabsTool(
                 api_key=os.getenv("ELEVENLABS_API_KEY")
             )
         else:
-            self.audio_gen_tool = VDBAudioGenerationTool(
-                collection_id=collection_id
+            self.audio_gen_tool = VDBAudioGenerationTool(collection_id=collection_id)
+
+    def _plan_checkpoint_with_lease(
+        self,
+        *,
+        checkpoint_store: TextToMovieCheckpointStore,
+        checkpoint_id: str,
+        request_fingerprint: str,
+        storyline: str,
+        engine: str,
+        audio_engine: str,
+    ) -> TextToMovieCheckpoint:
+        generation_run_id = make_generation_run_id(request_fingerprint)
+        operation_id = make_operation_id(generation_run_id, kind="planning")
+        lease = self._acquire_operation_lease(operation_id)
+        try:
+            existing = checkpoint_store.get(checkpoint_id)
+            if existing is not None:
+                return existing
+
+            visual_style = self.generate_visual_style(storyline)
+            self._heartbeat_operation_lease(lease, operation_id)
+            scenes = self.generate_scene_sequence(storyline, visual_style, engine)
+            self._heartbeat_operation_lease(lease, operation_id)
+            checkpoint = create_checkpoint(
+                request_fingerprint=request_fingerprint,
+                visual_style=visual_style.model_dump(mode="json"),
+                scenes=scenes,
+                video_provider=engine,
+                audio_provider=audio_engine,
             )
+            checkpoint_store.save(checkpoint)
+            return checkpoint
+        finally:
+            self._release_operation_lease(lease)
+
+    def _acquire_operation_lease(
+        self,
+        operation_id: str,
+        *,
+        scene_index: Optional[int] = None,
+    ):
+        result = self.generation_lease_store.acquire(
+            operation_id,
+            owner_id=self.generation_lease_owner_id,
+        )
+        if result.acquired and result.lease is not None:
+            return result.lease
+
+        raise TextToMovieExecutionError(
+            stage="concurrency",
+            code=result.reason_code,
+            message="Another worker owns this generation operation.",
+            scene_index=scene_index,
+            resumable=result.reason_code == "operation_locked",
+            operation_id=operation_id,
+            reconciliation={
+                "lease": safe_lease_summary(result.lease),
+            },
+        )
+
+    def _heartbeat_operation_lease(
+        self,
+        lease,
+        operation_id: str,
+        *,
+        scene_index: Optional[int] = None,
+    ) -> None:
+        try:
+            self.generation_lease_store.heartbeat(lease)
+        except GenerationLeaseLostError as exc:
+            raise TextToMovieExecutionError(
+                stage="concurrency",
+                code="operation_lease_lost",
+                message="Generation lease ownership was lost.",
+                scene_index=scene_index,
+                resumable=True,
+                operation_id=operation_id,
+            ) from exc
+
+    def _release_operation_lease(self, lease) -> None:
+        if lease is None:
+            return
+        try:
+            self.generation_lease_store.release(lease)
+        except Exception:
+            logger.exception("Failed to release generation lease")
+
+    def _assert_checkpoint_current(
+        self,
+        checkpoint: TextToMovieCheckpoint,
+        checkpoint_store: TextToMovieCheckpointStore,
+        *,
+        operation_id: str,
+        scene_index: Optional[int] = None,
+    ) -> None:
+        current = checkpoint_store.get(checkpoint.checkpoint_id)
+        if current is None or current.revision != checkpoint.revision:
+            raise TextToMovieExecutionError(
+                stage="concurrency",
+                code="checkpoint_changed_before_execution",
+                message="Checkpoint changed before operation execution.",
+                scene_index=scene_index,
+                resumable=True,
+                operation_id=operation_id,
+            )
+
+    @staticmethod
+    def _supports_keyword(func, keyword: str) -> bool:
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return False
+        if keyword in signature.parameters:
+            return True
+        return any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
 
     def _find_durable_artifact(self, operation, media_type: str):
         if operation.state not in (
@@ -497,7 +630,8 @@ class TextToMovieAgent(BaseAgent):
             return None
         if (
             operation.state == GenerationOperationState.failed
-            and operation.last_error_code not in {"scene_upload_failed", "audio_upload_failed"}
+            and operation.last_error_code
+            not in {"scene_upload_failed", "audio_upload_failed"}
         ):
             return None
 
@@ -625,53 +759,63 @@ class TextToMovieAgent(BaseAgent):
                 total_duration += float(reconciled_media.get("length", 0) or 0)
                 continue
 
-            self.output_message.actions.append(
-                f"Generating video for scene {index + 1}..."
-            )
-            self.output_message.push_update()
-
-            if not scene_checkpoint.prompt:
-                try:
-                    scene_checkpoint.prompt = self.generate_engine_prompt(
-                        scene,
-                        visual_style,
-                        engine,
-                    )
-                    checkpoint_store.save(checkpoint)
-                except Exception as exc:
-                    raise TextToMovieExecutionError(
-                        stage="scene_prompt",
-                        code="scene_prompt_failed",
-                        message="Unable to prepare the scene generation prompt.",
-                        scene_index=index,
-                        operation_id=operation.operation_id,
-                    ) from exc
-
-            suggested_duration = min(
-                scene["suggested_duration"],
-                engine_config.max_duration,
+            lease = self._acquire_operation_lease(
+                operation.operation_id,
+                scene_index=index,
             )
             video_path = f"{DOWNLOADS_PATH}/{uuid.uuid4()}.mp4"
             os.makedirs(DOWNLOADS_PATH, exist_ok=True)
-
             try:
+                self._assert_checkpoint_current(
+                    checkpoint,
+                    checkpoint_store,
+                    operation_id=operation.operation_id,
+                    scene_index=index,
+                )
+                self.output_message.actions.append(
+                    f"Generating video for scene {index + 1}..."
+                )
+                self.output_message.push_update()
+
+                if not scene_checkpoint.prompt:
+                    try:
+                        scene_checkpoint.prompt = self.generate_engine_prompt(
+                            scene,
+                            visual_style,
+                            engine,
+                        )
+                        checkpoint_store.save(checkpoint)
+                    except CheckpointConflictError:
+                        raise
+                    except Exception as exc:
+                        raise TextToMovieExecutionError(
+                            stage="scene_prompt",
+                            code="scene_prompt_failed",
+                            message="Unable to prepare the scene generation prompt.",
+                            scene_index=index,
+                            operation_id=operation.operation_id,
+                        ) from exc
+
+                suggested_duration = min(
+                    scene["suggested_duration"],
+                    engine_config.max_duration,
+                )
                 try:
                     video = self._execute_scene_generation(
                         checkpoint=checkpoint,
                         checkpoint_store=checkpoint_store,
                         operation=operation,
+                        lease=lease,
                         prompt=scene_checkpoint.prompt,
                         video_path=video_path,
                         duration=suggested_duration,
                         video_gen_config=video_gen_config,
+                        scene_index=index,
                     )
-                except TextToMovieExecutionError:
+                except (TextToMovieExecutionError, CheckpointConflictError):
                     raise
                 except Exception as exc:
-                    record_failure(
-                        operation,
-                        code="scene_generation_failed",
-                    )
+                    record_failure(operation, code="scene_generation_failed")
                     checkpoint_store.save(checkpoint)
                     raise TextToMovieExecutionError(
                         stage="scene_generation",
@@ -681,6 +825,11 @@ class TextToMovieAgent(BaseAgent):
                         operation_id=operation.operation_id,
                     ) from exc
 
+                self._heartbeat_operation_lease(
+                    lease,
+                    operation.operation_id,
+                    scene_index=index,
+                )
                 if video is None:
                     record_materialized(operation)
                     checkpoint_store.save(checkpoint)
@@ -688,6 +837,11 @@ class TextToMovieAgent(BaseAgent):
                         f"Uploading video for scene {index + 1}..."
                     )
                     self.output_message.push_update()
+                    self._heartbeat_operation_lease(
+                        lease,
+                        operation.operation_id,
+                        scene_index=index,
+                    )
                     try:
                         video = self.videodb_tool.upload(
                             video_path,
@@ -696,10 +850,7 @@ class TextToMovieAgent(BaseAgent):
                             name=make_artifact_name(operation.operation_id, "video"),
                         )
                     except Exception as exc:
-                        record_failure(
-                            operation,
-                            code="scene_upload_failed",
-                        )
+                        record_failure(operation, code="scene_upload_failed")
                         checkpoint_store.save(checkpoint)
                         raise TextToMovieExecutionError(
                             stage="scene_upload",
@@ -708,14 +859,16 @@ class TextToMovieAgent(BaseAgent):
                             scene_index=index,
                             operation_id=operation.operation_id,
                         ) from exc
+                    self._heartbeat_operation_lease(
+                        lease,
+                        operation.operation_id,
+                        scene_index=index,
+                    )
 
                 try:
                     media = compact_media(video)
                 except ValueError as exc:
-                    record_failure(
-                        operation,
-                        code="invalid_scene_media",
-                    )
+                    record_failure(operation, code="invalid_scene_media")
                     checkpoint_store.save(checkpoint)
                     raise TextToMovieExecutionError(
                         stage="scene_generation",
@@ -738,6 +891,7 @@ class TextToMovieAgent(BaseAgent):
             finally:
                 if os.path.exists(video_path):
                     os.remove(video_path)
+                self._release_operation_lease(lease)
 
         return total_duration
 
@@ -747,44 +901,68 @@ class TextToMovieAgent(BaseAgent):
         checkpoint: TextToMovieCheckpoint,
         checkpoint_store: TextToMovieCheckpointStore,
         operation,
+        lease,
         prompt: str,
         video_path: str,
         duration: float,
         video_gen_config: dict,
+        scene_index: int,
     ):
         supports_resume = callable(
             getattr(self.video_gen_tool, "resume_text_to_video", None)
         )
+
+        def heartbeat():
+            self._heartbeat_operation_lease(
+                lease,
+                operation.operation_id,
+                scene_index=scene_index,
+            )
+
+        heartbeat()
         if operation.provider_request_id and supports_resume:
             begin_resume(operation)
             checkpoint_store.save(checkpoint)
-            return self.video_gen_tool.resume_text_to_video(
-                operation.provider_request_id,
-                video_path,
-            )
+            resume = self.video_gen_tool.resume_text_to_video
+            kwargs = {}
+            if self._supports_keyword(resume, "on_heartbeat"):
+                kwargs["on_heartbeat"] = heartbeat
+            result = resume(operation.provider_request_id, video_path, **kwargs)
+            heartbeat()
+            return result
 
         begin_submission(operation)
         checkpoint_store.save(checkpoint)
+        heartbeat()
 
         if supports_resume:
             def persist_request_id(request_id):
+                heartbeat()
                 record_provider_request(operation, request_id)
                 checkpoint_store.save(checkpoint)
+                heartbeat()
 
-            return self.video_gen_tool.text_to_video(
-                prompt=prompt,
-                save_at=video_path,
-                duration=duration,
-                config=video_gen_config,
-                on_request_id=persist_request_id,
-            )
+            call_kwargs = {
+                "prompt": prompt,
+                "save_at": video_path,
+                "duration": duration,
+                "config": video_gen_config,
+                "on_request_id": persist_request_id,
+            }
+            if self._supports_keyword(self.video_gen_tool.text_to_video, "on_heartbeat"):
+                call_kwargs["on_heartbeat"] = heartbeat
+            result = self.video_gen_tool.text_to_video(**call_kwargs)
+            heartbeat()
+            return result
 
-        return self.video_gen_tool.text_to_video(
+        result = self.video_gen_tool.text_to_video(
             prompt=prompt,
             save_at=video_path,
             duration=duration,
             config=video_gen_config,
         )
+        heartbeat()
+        return result
 
     def _resume_or_generate_audio(
         self,
@@ -819,26 +997,34 @@ class TextToMovieAgent(BaseAgent):
             checkpoint_store.save(checkpoint)
             return reconciled_media
 
-        if not checkpoint.audio_prompt:
-            try:
-                checkpoint.audio_prompt = self.generate_audio_prompt(storyline)
-                checkpoint_store.save(checkpoint)
-            except Exception as exc:
-                raise TextToMovieExecutionError(
-                    stage="audio_prompt",
-                    code="audio_prompt_failed",
-                    message="Unable to prepare the background audio prompt.",
-                    operation_id=operation.operation_id,
-                ) from exc
-
-        self.output_message.actions.append("Generating background music...")
-        self.output_message.push_update()
+        lease = self._acquire_operation_lease(operation.operation_id)
         os.makedirs(DOWNLOADS_PATH, exist_ok=True)
         sound_effects_path = f"{DOWNLOADS_PATH}/{uuid.uuid4()}.mp3"
-
         try:
+            self._assert_checkpoint_current(
+                checkpoint,
+                checkpoint_store,
+                operation_id=operation.operation_id,
+            )
+            if not checkpoint.audio_prompt:
+                try:
+                    checkpoint.audio_prompt = self.generate_audio_prompt(storyline)
+                    checkpoint_store.save(checkpoint)
+                except CheckpointConflictError:
+                    raise
+                except Exception as exc:
+                    raise TextToMovieExecutionError(
+                        stage="audio_prompt",
+                        code="audio_prompt_failed",
+                        message="Unable to prepare the background audio prompt.",
+                        operation_id=operation.operation_id,
+                    ) from exc
+
+            self.output_message.actions.append("Generating background music...")
+            self.output_message.push_update()
             begin_submission(operation)
             checkpoint_store.save(checkpoint)
+            self._heartbeat_operation_lease(lease, operation.operation_id)
             try:
                 sound_effects_media = self.audio_gen_tool.generate_sound_effect(
                     prompt=checkpoint.audio_prompt,
@@ -855,6 +1041,7 @@ class TextToMovieAgent(BaseAgent):
                     message="Unable to generate background audio.",
                     operation_id=operation.operation_id,
                 ) from exc
+            self._heartbeat_operation_lease(lease, operation.operation_id)
 
             if sound_effects_media is None:
                 record_materialized(operation)
@@ -863,6 +1050,7 @@ class TextToMovieAgent(BaseAgent):
                     "Uploading background music to VideoDB..."
                 )
                 self.output_message.push_update()
+                self._heartbeat_operation_lease(lease, operation.operation_id)
                 try:
                     sound_effects_media = self.videodb_tool.upload(
                         sound_effects_path,
@@ -879,6 +1067,7 @@ class TextToMovieAgent(BaseAgent):
                         message="Unable to persist generated background audio.",
                         operation_id=operation.operation_id,
                     ) from exc
+                self._heartbeat_operation_lease(lease, operation.operation_id)
 
             try:
                 media = compact_media(sound_effects_media)
@@ -903,6 +1092,49 @@ class TextToMovieAgent(BaseAgent):
         finally:
             if os.path.exists(sound_effects_path):
                 os.remove(sound_effects_path)
+            self._release_operation_lease(lease)
+
+    def _combine_with_lease(
+        self,
+        *,
+        checkpoint: TextToMovieCheckpoint,
+        checkpoint_store: TextToMovieCheckpointStore,
+        scenes: List[dict],
+        audio_media: Optional[dict],
+    ) -> str:
+        operation_id = make_operation_id(
+            checkpoint.generation_run_id,
+            kind="combine",
+        )
+        lease = self._acquire_operation_lease(operation_id)
+        try:
+            self._assert_checkpoint_current(
+                checkpoint,
+                checkpoint_store,
+                operation_id=operation_id,
+            )
+            self.output_message.actions.append("Combining assets into final video...")
+            self.output_message.push_update()
+            self._heartbeat_operation_lease(lease, operation_id)
+            try:
+                final_video = self.combine_assets(scenes, audio_media)
+            except Exception as exc:
+                raise TextToMovieExecutionError(
+                    stage="combine",
+                    code="combine_failed",
+                    message="Unable to combine generated assets.",
+                    operation_id=operation_id,
+                ) from exc
+            self._heartbeat_operation_lease(lease, operation_id)
+            checkpoint.status = "complete"
+            checkpoint.final_video = final_video
+            checkpoint.failure_stage = None
+            checkpoint.failure_code = None
+            checkpoint.failed_scene_index = None
+            checkpoint_store.save(checkpoint)
+            return final_video
+        finally:
+            self._release_operation_lease(lease)
 
     def generate_visual_style(self, storyline: str) -> VisualStyle:
         style_prompt = f"""
@@ -970,10 +1202,7 @@ class TextToMovieAgent(BaseAgent):
         }}
         Make sure suggested_duration is a number, not a string.
         """
-        sequence_message = ContextMessage(
-            content=sequence_prompt,
-            role=RoleTypes.user,
-        )
+        sequence_message = ContextMessage(content=sequence_prompt, role=RoleTypes.user)
         llm_response = self.llm.chat_completions(
             [sequence_message.to_llm_msg()],
             response_format={"type": "json_object"},
@@ -1044,10 +1273,7 @@ class TextToMovieAgent(BaseAgent):
         Focus on the music.
         Story context: {storyline}
         """
-        prompt_message = ContextMessage(
-            content=audio_prompt,
-            role=RoleTypes.user,
-        )
+        prompt_message = ContextMessage(content=audio_prompt, role=RoleTypes.user)
         llm_response = self.llm.chat_completions(
             [prompt_message.to_llm_msg()],
             response_format={"type": "text"},
