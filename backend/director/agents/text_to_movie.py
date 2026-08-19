@@ -21,6 +21,15 @@ from director.core.text_to_movie_contract import (
     parse_scene_sequence_response,
     parse_visual_style_response,
 )
+from director.core.text_to_movie_checkpoint import (
+    TextToMovieCheckpoint,
+    TextToMovieCheckpointStore,
+    TextToMovieExecutionError,
+    build_request_fingerprint,
+    compact_media,
+    create_checkpoint,
+    make_checkpoint_id,
+)
 from director.llm import get_default_llm
 from director.tools.kling import KlingAITool, PARAMS_CONFIG as KLING_PARAMS_CONFIG
 from director.tools.stabilityai import (
@@ -99,17 +108,6 @@ TEXT_TO_MOVIE_AGENT_PARAMETERS = {
 
 
 @dataclass
-class VideoGenResult:
-    """Track results of video generation."""
-
-    step_index: int
-    video_path: Optional[str]
-    success: bool
-    error: Optional[str] = None
-    video: Optional[dict] = None
-
-
-@dataclass
 class EngineConfig:
     name: str
     max_duration: int
@@ -159,8 +157,11 @@ class TextToMovieAgent(BaseAgent):
         *args,
         **kwargs,
     ) -> AgentResponse:
-        """Process the storyline to generate a movie."""
+        """Process the storyline to generate a movie with resumable checkpoints."""
         video_content = None
+        checkpoint = None
+        checkpoint_store = TextToMovieCheckpointStore(self.session)
+
         try:
             if job_type != "text_to_movie":
                 raise ValueError(f"Unsupported job type: {job_type}")
@@ -195,7 +196,34 @@ class TextToMovieAgent(BaseAgent):
                 )
             raw_storyline = raw_storyline.strip()
 
-            self.videodb_tool = VideoDBTool(collection_id=collection_id)
+            if engine not in self.engine_configs:
+                raise ValueError(f"Unsupported engine: {engine}")
+            if audio_engine not in SUPPORTED_AUDIO_ENGINES:
+                raise ValueError(f"Unsupported audio engine: {audio_engine}")
+
+            self.video_gen_config_key = (
+                "video_stabilityai_config"
+                if engine == "stabilityai"
+                else "video_kling_config"
+            )
+            self.audio_gen_config_key = "audio_elevenlabs_config"
+            video_gen_config = text_to_movie.get(self.video_gen_config_key, {})
+            if engine == "videodb":
+                audio_gen_config = {}
+            else:
+                audio_gen_config = text_to_movie.get(self.audio_gen_config_key, {})
+
+            request_fingerprint = build_request_fingerprint(
+                collection_id=collection_id,
+                engine=engine,
+                audio_engine=audio_engine,
+                storyline=raw_storyline,
+                video_config=video_gen_config,
+                audio_config=audio_gen_config,
+            )
+            checkpoint_id = make_checkpoint_id(request_fingerprint)
+            checkpoint = checkpoint_store.get(checkpoint_id)
+
             self.output_message.actions.append("Processing input...")
             video_content = VideoContent(
                 agent_name=self.agent_name,
@@ -205,151 +233,72 @@ class TextToMovieAgent(BaseAgent):
             self.output_message.content.append(video_content)
             self.output_message.push_update()
 
-            if engine not in self.engine_configs:
-                raise ValueError(f"Unsupported engine: {engine}")
-
-            if engine == "stabilityai":
-                stability_api_key = os.getenv("STABILITYAI_API_KEY")
-                if not stability_api_key:
-                    raise Exception("Stability AI API key not found")
-                self.video_gen_tool = StabilityAITool(api_key=stability_api_key)
-                self.video_gen_config_key = "video_stabilityai_config"
-            elif engine == "kling":
-                kling_api_access_key = os.getenv("KLING_AI_ACCESS_API_KEY")
-                kling_api_secret_key = os.getenv("KLING_AI_SECRET_API_KEY")
-                if not kling_api_access_key or not kling_api_secret_key:
-                    raise Exception("Kling AI API key not found")
-                self.video_gen_tool = KlingAITool(
-                    access_key=kling_api_access_key,
-                    secret_key=kling_api_secret_key,
+            if checkpoint is not None and checkpoint.status == "complete" and checkpoint.final_video:
+                video_content.video = VideoData(stream_url=checkpoint.final_video)
+                video_content.status = MsgStatus.success
+                video_content.status_message = "Movie generation complete"
+                self.output_message.publish()
+                return AgentResponse(
+                    status=AgentStatus.SUCCESS,
+                    message="Movie already generated; resumed from completed checkpoint.",
+                    data={
+                        "video_url": checkpoint.final_video,
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "resumed": True,
+                    },
                 )
-                self.video_gen_config_key = "video_kling_config"
-            elif engine == "videodb":
-                self.video_gen_config_key = "video_kling_config"
-                self.video_gen_tool = VDBVideoGenerationTool()
+
+            self._validate_provider_configuration(engine, audio_engine)
+
+            if checkpoint is None:
+                visual_style = self.generate_visual_style(raw_storyline)
+                scenes = self.generate_scene_sequence(raw_storyline, visual_style, engine)
+                checkpoint = create_checkpoint(
+                    request_fingerprint=request_fingerprint,
+                    visual_style=visual_style.model_dump(mode="json"),
+                    scenes=scenes,
+                )
+                checkpoint_store.save(checkpoint)
             else:
-                raise Exception(f"{engine} not supported")
+                visual_style = VisualStyle.model_validate(checkpoint.visual_style)
+                scenes = [dict(scene.plan) for scene in checkpoint.scenes]
 
-            self.audio_gen_config_key = "audio_elevenlabs_config"
-            if audio_engine == "elevenlabs":
-                elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
-                if not elevenlabs_api_key:
-                    raise Exception("ElevenLabs API key not found")
-                self.audio_gen_tool = ElevenLabsTool(api_key=elevenlabs_api_key)
-            else:
-                self.audio_gen_tool = VDBAudioGenerationTool()
-
-            video_gen_config = text_to_movie.get(self.video_gen_config_key, {})
-            if engine == "videodb":
-                audio_gen_config = {}
-            else:
-                audio_gen_config = text_to_movie.get(self.audio_gen_config_key, {})
-
-            # Planning is fully validated before any video/audio generation side effects.
-            visual_style = self.generate_visual_style(raw_storyline)
-            scenes = self.generate_scene_sequence(raw_storyline, visual_style, engine)
-
-            self.output_message.actions.append(
-                f"Generating {len(scenes)} videos..."
-            )
-            self.output_message.push_update()
-
-            engine_config = self.engine_configs[engine]
-            generated_videos_results = []
-
-            for index, scene in enumerate(scenes):
-                self.output_message.actions.append(
-                    f"Generating video for scene {index + 1}..."
-                )
-                self.output_message.push_update()
-
-                suggested_duration = min(
-                    scene["suggested_duration"], engine_config.max_duration
-                )
-                prompt = self.generate_engine_prompt(scene, visual_style, engine)
-
-                video_path = f"{DOWNLOADS_PATH}/{str(uuid.uuid4())}.mp4"
-                os.makedirs(DOWNLOADS_PATH, exist_ok=True)
-
-                video = self.video_gen_tool.text_to_video(
-                    prompt=prompt,
-                    save_at=video_path,
-                    duration=suggested_duration,
-                    config=video_gen_config,
-                )
-                generated_videos_results.append(
-                    VideoGenResult(
-                        step_index=index,
-                        video_path=video_path,
-                        success=True,
-                        video=video,
-                    )
-                )
-
-            self.output_message.actions.append(
-                f"Uploading {len(generated_videos_results)} videos to VideoDB..."
-            )
-            self.output_message.push_update()
-
-            total_duration = 0
-            for result in generated_videos_results:
-                if not result.success:
-                    raise Exception(
-                        f"Failed to generate video {result.step_index}: {result.error}"
-                    )
-                if result.video is None:
-                    self.output_message.actions.append(
-                        f"Uploading video {result.step_index + 1}..."
-                    )
-                    self.output_message.push_update()
-                    media = self.videodb_tool.upload(
-                        result.video_path,
-                        source_type="file_path",
-                        media_type="video",
-                    )
-                else:
-                    media = result.video
-
-                total_duration += float(media.get("length", 0))
-                scenes[result.step_index]["video"] = media
-
-                if os.path.exists(result.video_path):
-                    os.remove(result.video_path)
-
-            sound_effects_description = self.generate_audio_prompt(raw_storyline)
-
-            self.output_message.actions.append("Generating background music...")
-            self.output_message.push_update()
-
-            os.makedirs(DOWNLOADS_PATH, exist_ok=True)
-            sound_effects_path = f"{DOWNLOADS_PATH}/{str(uuid.uuid4())}.mp3"
-
-            sound_effects_media = self.audio_gen_tool.generate_sound_effect(
-                prompt=sound_effects_description,
-                save_at=sound_effects_path,
-                duration=total_duration,
-                config=audio_gen_config,
+            self._initialize_media_tools(collection_id, engine, audio_engine)
+            total_duration = self._resume_or_generate_scenes(
+                checkpoint=checkpoint,
+                checkpoint_store=checkpoint_store,
+                scenes=scenes,
+                visual_style=visual_style,
+                engine=engine,
+                video_gen_config=video_gen_config,
             )
 
-            if sound_effects_media is None:
-                self.output_message.actions.append(
-                    "Uploading background music to VideoDB..."
-                )
-                self.output_message.push_update()
-
-                sound_effects_media = self.videodb_tool.upload(
-                    sound_effects_path,
-                    source_type="file_path",
-                    media_type="audio",
-                )
-
-            if os.path.exists(sound_effects_path):
-                os.remove(sound_effects_path)
+            sound_effects_media = self._resume_or_generate_audio(
+                checkpoint=checkpoint,
+                checkpoint_store=checkpoint_store,
+                storyline=raw_storyline,
+                total_duration=total_duration,
+                audio_gen_config=audio_gen_config,
+            )
 
             self.output_message.actions.append("Combining assets into final video...")
             self.output_message.push_update()
 
-            final_video = self.combine_assets(scenes, sound_effects_media)
+            try:
+                final_video = self.combine_assets(scenes, sound_effects_media)
+            except Exception as exc:
+                raise TextToMovieExecutionError(
+                    stage="combine",
+                    code="combine_failed",
+                    message="Unable to combine generated assets.",
+                ) from exc
+
+            checkpoint.status = "complete"
+            checkpoint.final_video = final_video
+            checkpoint.failure_stage = None
+            checkpoint.failure_code = None
+            checkpoint.failed_scene_index = None
+            checkpoint_store.save(checkpoint)
 
             video_content.video = VideoData(stream_url=final_video)
             video_content.status = MsgStatus.success
@@ -359,7 +308,11 @@ class TextToMovieAgent(BaseAgent):
             return AgentResponse(
                 status=AgentStatus.SUCCESS,
                 message="Movie generated successfully",
-                data={"video_url": final_video},
+                data={
+                    "video_url": final_video,
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "resumed": checkpoint.completed_scene_count > 0,
+                },
             )
 
         except StructuredGenerationError as error:
@@ -382,16 +335,298 @@ class TextToMovieAgent(BaseAgent):
                     "details": error.details,
                 },
             )
-        except Exception as e:
-            logger.exception(f"Error in {self.agent_name} agent: {e}")
+        except TextToMovieExecutionError as error:
+            logger.warning(
+                "Text-to-movie execution paused at %s: %s",
+                error.stage,
+                error.code,
+            )
+            if checkpoint is not None:
+                checkpoint.status = "failed"
+                checkpoint.failure_stage = error.stage
+                checkpoint.failure_code = error.code
+                checkpoint.failed_scene_index = error.scene_index
+                checkpoint_store.save(checkpoint)
+
+            if video_content is not None:
+                video_content.status = MsgStatus.error
+                video_content.status_message = "Movie generation paused and can be resumed"
+                self.output_message.publish()
+
+            completed_scenes = checkpoint.completed_scene_count if checkpoint else 0
+            total_scenes = len(checkpoint.scenes) if checkpoint else 0
+            data = {
+                "error": "text_to_movie_partial_failure",
+                "stage": error.stage,
+                "code": error.code,
+                "resumable": bool(error.resumable and checkpoint is not None),
+                "completed_scenes": completed_scenes,
+                "total_scenes": total_scenes,
+            }
+            if checkpoint is not None:
+                data["checkpoint_id"] = checkpoint.checkpoint_id
+            if error.scene_index is not None:
+                data["failed_scene_index"] = error.scene_index
+
+            return AgentResponse(
+                status=AgentStatus.ERROR,
+                message="Movie generation paused after a recoverable pipeline failure.",
+                data=data,
+            )
+        except Exception as exc:
+            logger.exception("Unexpected error in %s agent", self.agent_name)
             if video_content is not None:
                 video_content.status = MsgStatus.error
                 video_content.status_message = "Error generating movie"
                 self.output_message.publish()
             return AgentResponse(
                 status=AgentStatus.ERROR,
-                message=f"Agent failed with error: {str(e)}",
+                message="Movie generation failed unexpectedly.",
+                data={"error": "text_to_movie_failed"},
             )
+
+    def _validate_provider_configuration(self, engine: str, audio_engine: str) -> None:
+        if engine == "stabilityai" and not os.getenv("STABILITYAI_API_KEY"):
+            raise TextToMovieExecutionError(
+                stage="initialization",
+                code="video_provider_not_configured",
+                message="The selected video provider is not configured.",
+                resumable=False,
+            )
+        if engine == "kling" and (
+            not os.getenv("KLING_AI_ACCESS_API_KEY")
+            or not os.getenv("KLING_AI_SECRET_API_KEY")
+        ):
+            raise TextToMovieExecutionError(
+                stage="initialization",
+                code="video_provider_not_configured",
+                message="The selected video provider is not configured.",
+                resumable=False,
+            )
+        if audio_engine == "elevenlabs" and not os.getenv("ELEVENLABS_API_KEY"):
+            raise TextToMovieExecutionError(
+                stage="initialization",
+                code="audio_provider_not_configured",
+                message="The selected audio provider is not configured.",
+                resumable=False,
+            )
+
+    def _initialize_media_tools(
+        self,
+        collection_id: str,
+        engine: str,
+        audio_engine: str,
+    ) -> None:
+        self.videodb_tool = VideoDBTool(collection_id=collection_id)
+
+        if engine == "stabilityai":
+            self.video_gen_tool = StabilityAITool(api_key=os.getenv("STABILITYAI_API_KEY"))
+        elif engine == "kling":
+            self.video_gen_tool = KlingAITool(
+                access_key=os.getenv("KLING_AI_ACCESS_API_KEY"),
+                secret_key=os.getenv("KLING_AI_SECRET_API_KEY"),
+            )
+        else:
+            self.video_gen_tool = VDBVideoGenerationTool()
+
+        if audio_engine == "elevenlabs":
+            self.audio_gen_tool = ElevenLabsTool(api_key=os.getenv("ELEVENLABS_API_KEY"))
+        else:
+            self.audio_gen_tool = VDBAudioGenerationTool()
+
+    def _resume_or_generate_scenes(
+        self,
+        *,
+        checkpoint: TextToMovieCheckpoint,
+        checkpoint_store: TextToMovieCheckpointStore,
+        scenes: List[dict],
+        visual_style: VisualStyle,
+        engine: str,
+        video_gen_config: dict,
+    ) -> float:
+        self.output_message.actions.append(
+            f"Preparing {len(checkpoint.scenes)} scene videos..."
+        )
+        self.output_message.push_update()
+
+        total_duration = 0.0
+        engine_config = self.engine_configs[engine]
+
+        for scene_checkpoint in checkpoint.scenes:
+            index = scene_checkpoint.index
+            scene = scenes[index]
+
+            if scene_checkpoint.status == "complete" and scene_checkpoint.media:
+                scene["video"] = scene_checkpoint.media
+                total_duration += float(scene_checkpoint.media.get("length", 0) or 0)
+                continue
+
+            self.output_message.actions.append(
+                f"Generating video for scene {index + 1}..."
+            )
+            self.output_message.push_update()
+
+            if not scene_checkpoint.prompt:
+                try:
+                    scene_checkpoint.prompt = self.generate_engine_prompt(
+                        scene, visual_style, engine
+                    )
+                    checkpoint_store.save(checkpoint)
+                except Exception as exc:
+                    raise TextToMovieExecutionError(
+                        stage="scene_prompt",
+                        code="scene_prompt_failed",
+                        message="Unable to prepare the scene generation prompt.",
+                        scene_index=index,
+                    ) from exc
+
+            suggested_duration = min(
+                scene["suggested_duration"], engine_config.max_duration
+            )
+            video_path = f"{DOWNLOADS_PATH}/{str(uuid.uuid4())}.mp4"
+            os.makedirs(DOWNLOADS_PATH, exist_ok=True)
+
+            try:
+                try:
+                    video = self.video_gen_tool.text_to_video(
+                        prompt=scene_checkpoint.prompt,
+                        save_at=video_path,
+                        duration=suggested_duration,
+                        config=video_gen_config,
+                    )
+                except Exception as exc:
+                    raise TextToMovieExecutionError(
+                        stage="scene_generation",
+                        code="scene_generation_failed",
+                        message="Unable to generate a scene video.",
+                        scene_index=index,
+                    ) from exc
+
+                if video is None:
+                    self.output_message.actions.append(
+                        f"Uploading video for scene {index + 1}..."
+                    )
+                    self.output_message.push_update()
+                    try:
+                        video = self.videodb_tool.upload(
+                            video_path,
+                            source_type="file_path",
+                            media_type="video",
+                        )
+                    except Exception as exc:
+                        raise TextToMovieExecutionError(
+                            stage="scene_upload",
+                            code="scene_upload_failed",
+                            message="Unable to persist a generated scene video.",
+                            scene_index=index,
+                        ) from exc
+
+                try:
+                    media = compact_media(video)
+                except ValueError as exc:
+                    raise TextToMovieExecutionError(
+                        stage="scene_generation",
+                        code="invalid_scene_media",
+                        message="The scene provider returned an invalid media result.",
+                        scene_index=index,
+                    ) from exc
+
+                scene_checkpoint.media = media
+                scene_checkpoint.status = "complete"
+                checkpoint.status = "generating"
+                checkpoint.failure_stage = None
+                checkpoint.failure_code = None
+                checkpoint.failed_scene_index = None
+                checkpoint_store.save(checkpoint)
+
+                scene["video"] = media
+                total_duration += float(media.get("length", 0) or 0)
+            finally:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+
+        return total_duration
+
+    def _resume_or_generate_audio(
+        self,
+        *,
+        checkpoint: TextToMovieCheckpoint,
+        checkpoint_store: TextToMovieCheckpointStore,
+        storyline: str,
+        total_duration: float,
+        audio_gen_config: dict,
+    ) -> dict:
+        if checkpoint.audio_media:
+            return checkpoint.audio_media
+
+        if not checkpoint.audio_prompt:
+            try:
+                checkpoint.audio_prompt = self.generate_audio_prompt(storyline)
+                checkpoint_store.save(checkpoint)
+            except Exception as exc:
+                raise TextToMovieExecutionError(
+                    stage="audio_prompt",
+                    code="audio_prompt_failed",
+                    message="Unable to prepare the background audio prompt.",
+                ) from exc
+
+        self.output_message.actions.append("Generating background music...")
+        self.output_message.push_update()
+
+        os.makedirs(DOWNLOADS_PATH, exist_ok=True)
+        sound_effects_path = f"{DOWNLOADS_PATH}/{str(uuid.uuid4())}.mp3"
+        try:
+            try:
+                sound_effects_media = self.audio_gen_tool.generate_sound_effect(
+                    prompt=checkpoint.audio_prompt,
+                    save_at=sound_effects_path,
+                    duration=total_duration,
+                    config=audio_gen_config,
+                )
+            except Exception as exc:
+                raise TextToMovieExecutionError(
+                    stage="audio_generation",
+                    code="audio_generation_failed",
+                    message="Unable to generate background audio.",
+                ) from exc
+
+            if sound_effects_media is None:
+                self.output_message.actions.append(
+                    "Uploading background music to VideoDB..."
+                )
+                self.output_message.push_update()
+                try:
+                    sound_effects_media = self.videodb_tool.upload(
+                        sound_effects_path,
+                        source_type="file_path",
+                        media_type="audio",
+                    )
+                except Exception as exc:
+                    raise TextToMovieExecutionError(
+                        stage="audio_upload",
+                        code="audio_upload_failed",
+                        message="Unable to persist generated background audio.",
+                    ) from exc
+
+            try:
+                media = compact_media(sound_effects_media)
+            except ValueError as exc:
+                raise TextToMovieExecutionError(
+                    stage="audio_generation",
+                    code="invalid_audio_media",
+                    message="The audio provider returned an invalid media result.",
+                ) from exc
+
+            checkpoint.audio_media = media
+            checkpoint.status = "audio_complete"
+            checkpoint.failure_stage = None
+            checkpoint.failure_code = None
+            checkpoint.failed_scene_index = None
+            checkpoint_store.save(checkpoint)
+            return media
+        finally:
+            if os.path.exists(sound_effects_path):
+                os.remove(sound_effects_path)
 
     def generate_visual_style(self, storyline: str) -> VisualStyle:
         """Generate and validate a consistent visual style for the film."""
@@ -479,7 +714,7 @@ class TextToMovieAgent(BaseAgent):
             {style.character_constants.physical_description}.
             {style.lighting_style}, {style.color_grading}.
             Photorealistic, detailed, high quality, masterful composition.
-            """
+            """.strip()
 
         initial_prompt = f"""
         {style.director_reference} style shot.
@@ -512,6 +747,8 @@ class TextToMovieAgent(BaseAgent):
         llm_response = self.llm.chat_completions(
             [compression_message.to_llm_msg()], response_format={"type": "text"}
         )
+        if not getattr(llm_response, "status", False) or not getattr(llm_response, "content", ""):
+            raise ValueError("scene prompt generation failed")
         return llm_response.content
 
     def generate_audio_prompt(self, storyline: str) -> str:
@@ -532,6 +769,8 @@ class TextToMovieAgent(BaseAgent):
         llm_response = self.llm.chat_completions(
             [prompt_message.to_llm_msg()], response_format={"type": "text"}
         )
+        if not getattr(llm_response, "status", False) or not getattr(llm_response, "content", ""):
+            raise ValueError("audio prompt generation failed")
         return llm_response.content[:100]
 
     def combine_assets(self, scenes: List[dict], audio_media: Optional[dict]) -> str:
