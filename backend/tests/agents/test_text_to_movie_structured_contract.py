@@ -25,6 +25,7 @@ class MsgStatus:
 
 class RoleTypes:
     user = "user"
+    system = "system"
 
 
 class ContextMessage:
@@ -63,9 +64,24 @@ class FakeOutputMessage:
         self.publish_count += 1
 
 
+class FakeDB:
+    def __init__(self):
+        self.context = {}
+
+    def get_context_messages(self, session_id):
+        return self.context.get(session_id, {})
+
+    def add_or_update_context_msg(self, session_id, context):
+        self.context[session_id] = context
+
+
 class FakeSession:
     def __init__(self):
         self.output_message = FakeOutputMessage()
+        self.db = FakeDB()
+        self.session_id = "session-1"
+        self.agent_context = {}
+        self.state = {}
 
 
 class BaseAgent:
@@ -202,6 +218,9 @@ def load_text_to_movie_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "director.tools.elevenlabs", elevenlabs_module)
     monkeypatch.setitem(sys.modules, "director.tools.videodb_tool", videodb_tool_module)
     monkeypatch.setitem(sys.modules, "director.constants", constants_module)
+
+    # Ensure the checkpoint module binds to the stubbed session contract.
+    sys.modules.pop("director.core.text_to_movie_checkpoint", None)
 
     agent_path = (
         Path(__file__).resolve().parents[2]
