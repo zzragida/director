@@ -30,6 +30,7 @@ from director.agents.voice_replacement import VoiceReplacementAgent
 
 from director.core.session import Session, InputMessage, MsgStatus
 from director.core.reasoning import ReasoningEngine
+from director.core.media_reference import MediaReferenceError, resolve_media_reference
 from director.db.base import BaseDB
 from director.db import load_db
 from director.tools.videodb_tool import VideoDBTool
@@ -72,19 +73,23 @@ class ChatHandler:
             PricingAgent,
         ]
 
-    def add_videodb_state(self, session):
-        from videodb import connect
+    def add_videodb_state(self, session, media_state=None):
+        """Attach a validated VideoDB state to the session.
 
-        session.state["conn"] = connect(
-            base_url=os.getenv("VIDEO_DB_BASE_URL", "https://api.videodb.io")
-        )
-        session.state["collection"] = session.state["conn"].get_collection(
-            session.collection_id
-        )
-        if session.video_id:
-            session.state["video"] = session.state["collection"].get_video(
-                session.video_id
+        Socket.IO requests pass a pre-resolved state so media references are not
+        looked up twice. Direct/internal calls use the same resolver here.
+        """
+        if media_state is None:
+            from videodb import connect
+
+            media_state = resolve_media_reference(
+                connect,
+                base_url=os.getenv("VIDEO_DB_BASE_URL", "https://api.videodb.io"),
+                collection_id=session.collection_id,
+                video_id=session.video_id,
             )
+
+        session.state.update(media_state)
 
     def agents_list(self):
         return [
@@ -113,7 +118,7 @@ class ChatHandler:
         ]
         return selected_agents, unknown_agents
 
-    def chat(self, message):
+    def chat(self, message, media_state=None):
         logger.info(f"ChatHandler input message: {message}")
 
         session = Session(db=self.db, **message)
@@ -122,7 +127,7 @@ class ChatHandler:
         input_message.publish()
 
         try:
-            self.add_videodb_state(session)
+            self.add_videodb_state(session, media_state=media_state)
             agents = [agent(session=session) for agent in self.agents]
             selected_agents, unknown_agents = self.select_requested_agents(
                 agents, input_message.agents
@@ -141,6 +146,12 @@ class ChatHandler:
             res_eng.register_agents(selected_agents)
             res_eng.run()
 
+        except MediaReferenceError as error:
+            safe_error = f"Media reference error [{error.code}]: {error.message}"
+            session.output_message.actions.append(safe_error)
+            session.output_message.update_status(MsgStatus.error)
+            logger.warning(safe_error)
+            return
         except Exception as e:
             session.output_message.update_status(MsgStatus.error)
             logger.exception(f"Error in chat handler: {e}")
