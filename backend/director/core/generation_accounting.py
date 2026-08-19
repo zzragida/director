@@ -28,7 +28,7 @@ class UsageMetric(BaseModel):
 class RateCardLine(BaseModel):
     """One explicit pricing rule supplied by an operator, not by Director defaults."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     provider: str
     operation_kind: str
@@ -66,7 +66,7 @@ class RateCardSnapshot(BaseModel):
 
 
 class OperationCostAttribution(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     operation_id: str
     operation_kind: str
@@ -267,12 +267,16 @@ def build_cost_summary(
             operations.append(cost)
 
     final = getattr(manifest, "final", None)
-    if final is not None and getattr(final, "operation_id", None):
+    if (
+        final is not None
+        and getattr(final, "operation_id", None)
+        and getattr(final, "stream_url", None)
+    ):
         final_entry = type("FinalCostEntry", (), {
             "operation_id": final.operation_id,
             "provider": "director",
             "provider_config": {},
-            "attempt_count": 1 if getattr(final, "stream_url", None) else 0,
+            "attempt_count": 1,
             "artifact_length": None,
         })()
         cost = _build_operation_cost(
