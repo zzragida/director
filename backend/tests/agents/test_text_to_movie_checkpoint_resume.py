@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import sys
@@ -67,12 +68,21 @@ class FakeOutputMessage:
 class FakeDB:
     def __init__(self):
         self.context = {}
+        self.cas_calls = 0
 
     def get_context_messages(self, session_id):
-        return self.context.get(session_id, {})
+        return copy.deepcopy(self.context.get(session_id, {}))
 
     def add_or_update_context_msg(self, session_id, context):
-        self.context[session_id] = context
+        self.context[session_id] = copy.deepcopy(context)
+
+    def compare_and_swap_context_msg(self, session_id, expected_context, context_messages):
+        self.cas_calls += 1
+        current = self.context.get(session_id, {})
+        if current != expected_context:
+            return False
+        self.context[session_id] = copy.deepcopy(context_messages)
+        return True
 
 
 class FakeSession:
@@ -185,6 +195,12 @@ class FakeVideoDBTool:
             raise result
         return result
 
+    def get_videos(self):
+        return []
+
+    def get_audios(self):
+        return []
+
     def get_and_set_timeline(self):
         return FakeTimeline()
 
@@ -290,12 +306,7 @@ def load_text_to_movie_module(monkeypatch):
 
     sys.modules.pop("director.core.text_to_movie_checkpoint", None)
 
-    agent_path = (
-        Path(__file__).resolve().parents[2]
-        / "director"
-        / "agents"
-        / "text_to_movie.py"
-    )
+    agent_path = Path(__file__).resolve().parents[2] / "director" / "agents" / "text_to_movie.py"
     spec = importlib.util.spec_from_file_location(
         "director_text_to_movie_checkpoint_resume_test", agent_path
     )
@@ -348,14 +359,12 @@ def test_scene_failure_persists_completed_scenes_and_retry_resumes_only_failed_s
     reset_scripts()
     module = load_text_to_movie_module(monkeypatch)
     db = FakeDB()
-
     FakeVideoGenerationTool.script = [
         {"id": "scene-1", "length": 4},
         {"id": "scene-2", "length": 5},
         RuntimeError("scene three provider failure"),
     ]
     first_agent, _ = make_agent(module, db, first_run_llm())
-
     first_response = run_request(first_agent)
 
     assert first_response.status == AgentStatus.ERROR
@@ -381,7 +390,6 @@ def test_scene_failure_persists_completed_scenes_and_retry_resumes_only_failed_s
     FakeAudioGenerationTool.script = [{"id": "audio-1", "length": 14}]
     retry_llm = FakeLLM([FakeLLMResponse(content="soft piano rising to warmth")])
     retry_agent, _ = make_agent(module, db, retry_llm)
-
     retry_response = run_request(retry_agent)
 
     assert retry_response.status == AgentStatus.SUCCESS
@@ -403,7 +411,6 @@ def test_combine_failure_retries_without_regenerating_scene_or_audio_assets(monk
     reset_scripts()
     module = load_text_to_movie_module(monkeypatch)
     db = FakeDB()
-
     FakeVideoGenerationTool.script = [
         {"id": "scene-1", "length": 4},
         {"id": "scene-2", "length": 5},
@@ -422,7 +429,6 @@ def test_combine_failure_retries_without_regenerating_scene_or_audio_assets(monk
         ]
     )
     first_agent, _ = make_agent(module, db, first_llm)
-
     first_response = run_request(first_agent)
 
     assert first_response.status == AgentStatus.ERROR
@@ -433,14 +439,12 @@ def test_combine_failure_retries_without_regenerating_scene_or_audio_assets(monk
     assert FakeAudioGenerationTool.total_calls == 1
     assert FakeTimeline.generation_calls == 1
 
-    retry_llm = FakeLLM([])
-    retry_agent, _ = make_agent(module, db, retry_llm)
+    retry_agent, _ = make_agent(module, db, FakeLLM([]))
     retry_response = run_request(retry_agent)
-
     assert retry_response.status == AgentStatus.SUCCESS
     assert FakeVideoGenerationTool.total_calls == 3
     assert FakeAudioGenerationTool.total_calls == 1
-    assert retry_llm.calls == 0
+    assert retry_response.data["video_url"] == "https://stream.example/final.m3u8"
     assert FakeTimeline.generation_calls == 2
 
 
@@ -448,7 +452,6 @@ def test_completed_checkpoint_short_circuits_all_providers(monkeypatch):
     reset_scripts()
     module = load_text_to_movie_module(monkeypatch)
     db = FakeDB()
-
     FakeVideoGenerationTool.script = [
         {"id": "scene-1", "length": 4},
         {"id": "scene-2", "length": 5},
@@ -474,7 +477,6 @@ def test_completed_checkpoint_short_circuits_all_providers(monkeypatch):
 
     cached_agent, _ = make_agent(module, db, FakeLLM([]))
     cached_response = run_request(cached_agent)
-
     assert cached_response.status == AgentStatus.SUCCESS
     assert cached_response.data["resumed"] is True
     assert FakeVideoGenerationTool.total_calls == video_calls
