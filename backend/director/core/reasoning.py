@@ -186,16 +186,7 @@ class ReasoningEngine:
         return self.summary_content
 
     def run_agent(self, agent_name: str, *args, **kwargs) -> AgentResponse:
-        """Run an agent with the given name and arguments.
-
-        :param str agent_name: The name of the agent to run
-        :param args: The arguments to pass to the agent
-        :param kwargs: The keyword arguments to pass to the agent
-        :return: The response from the agent
-        """
-        print("-" * 40, f"Running {agent_name} Agent", "-" * 40)
-        print(kwargs, "\n\n")
-
+        """Run an agent with the given name and arguments."""
         agent = next(
             (agent for agent in self.agents if agent.agent_name == agent_name), None
         )
@@ -210,6 +201,77 @@ class ReasoningEngine:
         self.output_message.agents.append(agent_name)
         self.output_message.push_update()
         return agent.safe_call(*args, **kwargs)
+
+    def run_tool_call(self, tool_call) -> tuple[str, AgentResponse]:
+        """Validate the LLM tool-call envelope before keyword unpacking."""
+        if not isinstance(tool_call, dict):
+            return "invalid_tool_call", AgentResponse(
+                status=AgentStatus.ERROR,
+                message="Invalid tool call returned by the reasoning model.",
+                data={
+                    "error": "invalid_tool_call",
+                    "details": [
+                        {
+                            "field": "$",
+                            "code": "type_mismatch",
+                            "message": "expected object",
+                        }
+                    ],
+                },
+            )
+
+        tool = tool_call.get("tool")
+        if not isinstance(tool, dict):
+            return "invalid_tool_call", AgentResponse(
+                status=AgentStatus.ERROR,
+                message="Invalid tool call returned by the reasoning model.",
+                data={
+                    "error": "invalid_tool_call",
+                    "details": [
+                        {
+                            "field": "tool",
+                            "code": "type_mismatch",
+                            "message": "expected object",
+                        }
+                    ],
+                },
+            )
+
+        agent_name = tool.get("name")
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            return "invalid_tool_call", AgentResponse(
+                status=AgentStatus.ERROR,
+                message="Invalid tool call returned by the reasoning model.",
+                data={
+                    "error": "invalid_tool_call",
+                    "details": [
+                        {
+                            "field": "tool.name",
+                            "code": "required",
+                            "message": "agent name is required",
+                        }
+                    ],
+                },
+            )
+
+        arguments = tool.get("arguments", {})
+        if not isinstance(arguments, dict):
+            return agent_name, AgentResponse(
+                status=AgentStatus.ERROR,
+                message=f"Invalid arguments for {agent_name} agent.",
+                data={
+                    "error": "invalid_tool_arguments",
+                    "details": [
+                        {
+                            "field": "$",
+                            "code": "type_mismatch",
+                            "message": "expected object",
+                        }
+                    ],
+                },
+            )
+
+        return agent_name, self.run_agent(agent_name, **arguments)
 
     def stop(self):
         """Flag the tool to stop processing and exit the run() thread."""
@@ -229,11 +291,6 @@ class ReasoningEngine:
             tries += 1
             if tries > max_tries:
                 break
-            print("-" * 40, "Context", "-" * 40)
-            print(
-                [message.to_llm_msg() for message in self.session.reasoning_context],
-                "\n\n",
-            )
             llm_response: LLMResponse = self.llm.chat_completions(
                 messages=[
                     message.to_llm_msg() for message in self.session.reasoning_context
@@ -241,7 +298,7 @@ class ReasoningEngine:
                 + temp_messages,
                 tools=[agent.to_llm_format() for agent in self.agents],
             )
-            logger.info(f"LLM Response: {llm_response}")
+            logger.info("Reasoning model response received")
 
             if not llm_response.status:
                 self.output_message.content.append(
@@ -270,21 +327,19 @@ class ReasoningEngine:
                     )
                 )
                 for tool_call in llm_response.tool_calls:
-                    agent_response: AgentResponse = self.run_agent(
-                        tool_call["tool"]["name"],
-                        **tool_call["tool"]["arguments"],
-                    )
+                    agent_name, agent_response = self.run_tool_call(tool_call)
                     if agent_response.status == AgentStatus.ERROR:
-                        self.failed_agents.append(tool_call["tool"]["name"])
+                        self.failed_agents.append(agent_name)
+                    tool_call_id = (
+                        tool_call.get("id") if isinstance(tool_call, dict) else None
+                    )
                     self.session.reasoning_context.append(
                         ContextMessage(
                             content=agent_response.__str__(),
-                            tool_call_id=tool_call["id"],
+                            tool_call_id=tool_call_id,
                             role=RoleTypes.tool,
                         )
                     )
-                    print("-" * 40, "Agent Response", "-" * 40)
-                    print(agent_response, "\n\n")
                     status = agent_response.status
 
             if not self.summary_content:
@@ -302,7 +357,6 @@ class ReasoningEngine:
                     )
                 )
                 if self.iterations == self.max_iterations - 1:
-                    # Direct response case
                     self.summary_content.status_message = "Here is the response"
                     self.summary_content.text = llm_response.content
                     self.summary_content.status = self.get_outcome_status()
@@ -327,29 +381,21 @@ class ReasoningEngine:
                     self.summary_content.status_message = "Final Cut"
                 self.output_message.status = self.get_outcome_status()
                 self.output_message.publish()
-                print("-" * 40, "Stopping", "-" * 40)
                 self.stop()
                 break
 
     def run(self, max_iterations: int = None):
-        """Run the reasoning engine.
-
-        :param int max_iterations: The number of max_iterations to run the reasoning engine
-        """
+        """Run the reasoning engine."""
         self.iterations = max_iterations or self.max_iterations
         self.build_context()
         self.output_message.actions.append("Reasoning the message..")
         self.output_message.push_update()
 
-        it = 0
         while self.iterations > 0:
             self.iterations -= 1
-            print("-" * 40, "Reasoning Engine Iteration", it, "-" * 40)
             if self.stop_flag:
                 break
 
             self.step()
-            it = it + 1
 
         self.session.save_context_messages()
-        print("-" * 40, "Reasoning Engine Finished", "-" * 40)
