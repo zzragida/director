@@ -4,11 +4,16 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from director.core.generation_lifecycle import (
+    GenerationOperation,
+    create_operation,
+    make_generation_run_id,
+)
 from director.core.session import ContextMessage, RoleTypes
 
 
 CHECKPOINT_CONTEXT_KEY = "__text_to_movie_checkpoints__"
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 
 
 class TextToMovieExecutionError(RuntimeError):
@@ -22,6 +27,7 @@ class TextToMovieExecutionError(RuntimeError):
         message: str,
         scene_index: Optional[int] = None,
         resumable: bool = True,
+        operation_id: Optional[str] = None,
     ):
         super().__init__(message)
         self.stage = stage
@@ -29,6 +35,7 @@ class TextToMovieExecutionError(RuntimeError):
         self.message = message
         self.scene_index = scene_index
         self.resumable = resumable
+        self.operation_id = operation_id
 
 
 class SceneCheckpoint(BaseModel):
@@ -39,6 +46,7 @@ class SceneCheckpoint(BaseModel):
     prompt: Optional[str] = None
     media: Optional[Dict[str, Any]] = None
     status: str = "pending"
+    operation: Optional[GenerationOperation] = None
 
 
 class TextToMovieCheckpoint(BaseModel):
@@ -47,11 +55,13 @@ class TextToMovieCheckpoint(BaseModel):
     version: int = CHECKPOINT_VERSION
     checkpoint_id: str
     request_fingerprint: str
+    generation_run_id: Optional[str] = None
     status: str = "planned"
     visual_style: Dict[str, Any]
     scenes: List[SceneCheckpoint]
     audio_prompt: Optional[str] = None
     audio_media: Optional[Dict[str, Any]] = None
+    audio_operation: Optional[GenerationOperation] = None
     final_video: Optional[str] = None
     failure_stage: Optional[str] = None
     failure_code: Optional[str] = None
@@ -59,7 +69,64 @@ class TextToMovieCheckpoint(BaseModel):
 
     @property
     def completed_scene_count(self) -> int:
-        return sum(1 for scene in self.scenes if scene.status == "complete" and scene.media)
+        return sum(
+            1
+            for scene in self.scenes
+            if scene.status == "complete" and scene.media
+        )
+
+    def ensure_lifecycle(self, *, video_provider: str, audio_provider: str) -> bool:
+        """Backfill deterministic operation IDs for new or legacy checkpoints."""
+
+        changed = False
+        if not self.generation_run_id:
+            self.generation_run_id = make_generation_run_id(self.request_fingerprint)
+            changed = True
+
+        for scene in self.scenes:
+            if scene.operation is None:
+                scene.operation = create_operation(
+                    self.generation_run_id,
+                    kind="scene_video",
+                    provider=video_provider,
+                    index=scene.index,
+                )
+                if scene.media:
+                    scene.operation.artifact = dict(scene.media)
+                    scene.operation.state = "persisted"
+                    scene.operation.recoverable = False
+                changed = True
+
+        if self.audio_operation is None:
+            self.audio_operation = create_operation(
+                self.generation_run_id,
+                kind="background_audio",
+                provider=audio_provider,
+            )
+            if self.audio_media:
+                self.audio_operation.artifact = dict(self.audio_media)
+                self.audio_operation.state = "persisted"
+                self.audio_operation.recoverable = False
+            changed = True
+
+        if self.version != CHECKPOINT_VERSION:
+            self.version = CHECKPOINT_VERSION
+            changed = True
+        return changed
+
+    def unresolved_provider_operations(self) -> List[GenerationOperation]:
+        operations = [
+            scene.operation
+            for scene in self.scenes
+            if scene.operation is not None
+            and scene.operation.has_provider_resume_token
+        ]
+        if (
+            self.audio_operation is not None
+            and self.audio_operation.has_provider_resume_token
+        ):
+            operations.append(self.audio_operation)
+        return operations
 
 
 def build_request_fingerprint(
@@ -100,21 +167,31 @@ def create_checkpoint(
     request_fingerprint: str,
     visual_style: Dict[str, Any],
     scenes: List[Dict[str, Any]],
+    video_provider: Optional[str] = None,
+    audio_provider: Optional[str] = None,
 ) -> TextToMovieCheckpoint:
     checkpoint_id = make_checkpoint_id(request_fingerprint)
-    return TextToMovieCheckpoint(
+    generation_run_id = make_generation_run_id(request_fingerprint)
+    checkpoint = TextToMovieCheckpoint(
         checkpoint_id=checkpoint_id,
         request_fingerprint=request_fingerprint,
+        generation_run_id=generation_run_id,
         visual_style=visual_style,
         scenes=[
             SceneCheckpoint(index=index, plan=scene)
             for index, scene in enumerate(scenes)
         ],
     )
+    if video_provider and audio_provider:
+        checkpoint.ensure_lifecycle(
+            video_provider=video_provider,
+            audio_provider=audio_provider,
+        )
+    return checkpoint
 
 
 def compact_media(media: Any) -> Dict[str, Any]:
-    """Persist only the stable media fields needed for resume/composition."""
+    """Persist only stable media fields needed for resume/composition."""
 
     if not isinstance(media, dict):
         raise ValueError("media result must be an object")
@@ -149,7 +226,11 @@ class TextToMovieCheckpointStore:
         if not messages:
             return {}
 
-        content = messages[-1].get("content") if isinstance(messages[-1], dict) else None
+        content = (
+            messages[-1].get("content")
+            if isinstance(messages[-1], dict)
+            else None
+        )
         if not isinstance(content, str) or not content:
             return {}
 
@@ -179,10 +260,8 @@ class TextToMovieCheckpointStore:
         )
         message = ContextMessage(content=content, role=RoleTypes.system)
 
-        # Keep the normal Session save path aware of the checkpoint.
         self.session.agent_context[CHECKPOINT_CONTEXT_KEY] = [message]
 
-        # Persist immediately so completed external work survives a later crash.
         context = self.session.db.get_context_messages(self.session.session_id) or {}
         context[CHECKPOINT_CONTEXT_KEY] = [message.to_llm_msg()]
         self.session.db.add_or_update_context_msg(self.session.session_id, context)
