@@ -4,7 +4,7 @@ import time
 import logging
 import os
 
-from typing import List
+from typing import List, Optional
 
 from director.constants import DBType
 from director.db.base import BaseDB
@@ -38,15 +38,6 @@ class SQLiteDB(BaseDB):
         metadata: dict = {},
         **kwargs,
     ) -> None:
-        """Create a new session.
-
-        :param session_id: Unique session ID.
-        :param video_id: ID of the video associated with the session.
-        :param collection_id: ID of the collection associated with the session.
-        :param created_at: Timestamp when the session was created.
-        :param updated_at: Timestamp when the session was last updated.
-        :param metadata: Additional metadata for the session.
-        """
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
 
@@ -67,12 +58,6 @@ class SQLiteDB(BaseDB):
         self.conn.commit()
 
     def get_session(self, session_id: str) -> dict:
-        """Get a session by session_id.
-
-        :param session_id: Unique session ID.
-        :return: Session data as a dictionary.
-        :rtype: dict
-        """
         self.cursor.execute(
             "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
         )
@@ -81,16 +66,9 @@ class SQLiteDB(BaseDB):
             session = dict(row)
             session["metadata"] = json.loads(session["metadata"])
             return session
-
-        else:
-            return {}
+        return {}
 
     def get_sessions(self) -> list:
-        """Get all sessions.
-
-        :return: List of all sessions.
-        :rtype: list
-        """
         self.cursor.execute("SELECT * FROM sessions ORDER BY updated_at DESC")
         row = self.cursor.fetchall()
         sessions = [dict(r) for r in row]
@@ -113,20 +91,6 @@ class SQLiteDB(BaseDB):
         metadata: dict = {},
         **kwargs,
     ) -> None:
-        """Add a new message (input or output) to the conversation.
-
-        :param str session_id: Unique session ID.
-        :param str conv_id: Unique conversation ID.
-        :param str msg_id: Unique message ID.
-        :param str msg_type: Type of message (input or output).
-        :param list agents: List of agents involved in the conversation.
-        :param list actions: List of actions taken by the agents.
-        :param list content: List of message content.
-        :param str status: Status of the message.
-        :param int created_at: Timestamp when the message was created.
-        :param int updated_at: Timestamp when the message was last updated.
-        :param dict metadata: Additional metadata for the message.
-        """
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
 
@@ -169,12 +133,6 @@ class SQLiteDB(BaseDB):
         return conversations
 
     def get_context_messages(self, session_id: str) -> list:
-        """Get context messages for a session.
-
-        :param str session_id: Unique session ID.
-        :return: List of context messages.
-        :rtype: list
-        """
         self.cursor.execute(
             "SELECT context_data FROM context_messages WHERE session_id = ?",
             (session_id,),
@@ -191,14 +149,6 @@ class SQLiteDB(BaseDB):
         metadata: dict = {},
         **kwargs,
     ) -> None:
-        """Update context messages for a session.
-
-        :param str session_id: Unique session ID.
-        :param List context_messages: List of context messages.
-        :param int created_at: Timestamp when the context messages were created.
-        :param int updated_at: Timestamp when the context messages were last updated.
-        :param dict metadata: Additional metadata for the context messages.
-        """
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
 
@@ -217,12 +167,42 @@ class SQLiteDB(BaseDB):
         )
         self.conn.commit()
 
-    def delete_conversation(self, session_id: str) -> bool:
-        """Delete all conversations for a given session.
+    def compare_and_swap_context_msg(
+        self,
+        session_id: str,
+        expected_context: Optional[dict],
+        context_messages: dict,
+    ) -> bool:
+        """Atomically update the session context without overwriting a peer writer."""
 
-        :param str session_id: Unique session ID.
-        :return: True if conversations were deleted, False otherwise.
-        """
+        now = int(time.time())
+        new_context = json.dumps(context_messages)
+
+        if expected_context is None:
+            self.cursor.execute(
+                """
+                INSERT OR IGNORE INTO context_messages
+                    (context_data, session_id, created_at, updated_at, metadata)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (new_context, session_id, now, now, json.dumps({})),
+            )
+        else:
+            expected = json.dumps(expected_context)
+            self.cursor.execute(
+                """
+                UPDATE context_messages
+                SET context_data = ?, updated_at = ?
+                WHERE session_id = ? AND context_data = ?
+                """,
+                (new_context, now, session_id, expected),
+            )
+
+        changed = self.cursor.rowcount > 0
+        self.conn.commit()
+        return changed
+
+    def delete_conversation(self, session_id: str) -> bool:
         self.cursor.execute(
             "DELETE FROM conversations WHERE session_id = ?", (session_id,)
         )
@@ -230,11 +210,6 @@ class SQLiteDB(BaseDB):
         return self.cursor.rowcount > 0
 
     def delete_context(self, session_id: str) -> bool:
-        """Delete context messages for a given session.
-
-        :param str session_id: Unique session ID.
-        :return: True if context messages were deleted, False otherwise.
-        """
         self.cursor.execute(
             "DELETE FROM context_messages WHERE session_id = ?", (session_id,)
         )
@@ -242,15 +217,7 @@ class SQLiteDB(BaseDB):
         return self.cursor.rowcount > 0
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session and any associated conversation/context rows.
-
-        Conversation and context rows are optional during the session lifecycle, so
-        their absence is not considered a deletion failure. The operation succeeds
-        only when the session row itself is deleted. Database errors still propagate.
-
-        :param str session_id: Unique session ID.
-        :return: Tuple of success flag and failed component names.
-        """
+        """Delete a session and any associated conversation/context rows."""
         self.delete_conversation(session_id)
         self.delete_context(session_id)
 
@@ -262,7 +229,6 @@ class SQLiteDB(BaseDB):
         return session_deleted, failed_components
 
     def health_check(self) -> bool:
-        """Check if the SQLite database is healthy and the necessary tables exist. If not, create them."""
         try:
             query = """
                 SELECT COUNT(name)
@@ -276,7 +242,6 @@ class SQLiteDB(BaseDB):
                 logger.info("Tables not found. Initializing SQLite DB...")
                 initialize_sqlite(self.db_path)
             return True
-
         except Exception as e:
             logger.exception(f"SQLite health check failed: {e}")
             return False
