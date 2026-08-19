@@ -85,7 +85,6 @@ class UploadAgent(BaseAgent):
             content.status_message = f"{upload_data['name']} uploaded successfully"
             if media_type == "video":
                 content.video = VideoData(**upload_data)
-                # emit event to update the videos list
                 self.session.emit_event(
                     VideosUpdateEvent(collection_id=upload_data.get("collection_id"))
                 )
@@ -111,7 +110,6 @@ class UploadAgent(BaseAgent):
     def _get_yt_playlist_videos(self, playlist_url: str):
         """Get the list of videos from a youtube playlist."""
         try:
-            # Create the downloader object
             with yt_dlp.YoutubeDL({"extract_flat": True, "quiet": True}) as ydl:
                 playlist_info = ydl.extract_info(playlist_url, download=False)
             if "entries" in playlist_info:
@@ -129,21 +127,55 @@ class UploadAgent(BaseAgent):
             return None
 
     def _upload_yt_playlist(self, playlist_info: dict, media_type):
-        """Upload the videos in a youtube playlist."""
+        """Upload a playlist and preserve per-item failure semantics."""
+        failures = []
+        success_count = 0
+
         for media in playlist_info:
+            self.output_message.actions.append(
+                f"Uploading video: {media['title']} as {media_type}"
+            )
             try:
-                self.output_message.actions.append(
-                    f"Uploading video: {media['title']} as {media_type}"
-                )
-                self._upload(media["url"], "url", media_type)
+                response = self._upload(media["url"], "url", media_type)
             except Exception as e:
+                logger.exception(f"Error in uploading {media['title']}: {e}")
+                response = AgentResponse(status=AgentStatus.ERROR, message=str(e))
+
+            if response.status == AgentStatus.ERROR:
                 self.output_message.actions.append(
                     f"Upload failed for {media['title']}"
                 )
-                logger.exception(f"Error in uploading {media['title']}: {e}")
+                failures.append(
+                    {
+                        "title": media["title"],
+                        "url": media["url"],
+                        "error": response.message,
+                    }
+                )
+            else:
+                success_count += 1
+
+        result_data = {
+            "total": len(playlist_info),
+            "success_count": success_count,
+            "failure_count": len(failures),
+            "failed_items": failures,
+        }
+
+        if failures:
+            return AgentResponse(
+                status=AgentStatus.ERROR,
+                message=(
+                    f"Playlist upload completed with {len(failures)} failure(s) "
+                    f"out of {len(playlist_info)} items."
+                ),
+                data=result_data,
+            )
+
         return AgentResponse(
             status=AgentStatus.SUCCESS,
             message=f"All the videos in the playlist uploaded successfully as {media_type}",
+            data=result_data,
         )
 
     def run(
