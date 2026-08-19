@@ -26,8 +26,8 @@ class GenerationOperation(BaseModel):
     ``attempt_count`` is retained for backwards compatibility and counts both
     new provider submissions and provider resumes. Cost attribution must use
     ``submission_count`` instead because a resume/poll is not necessarily a new
-    billable generation request. Legacy v2 checkpoints intentionally load these
-    accounting counters as unknown (``None``) rather than guessing their split.
+    billable generation request. Legacy v2 checkpoints intentionally keep
+    ``accounting_complete=False`` rather than guessing their historical split.
     """
 
     model_config = ConfigDict(extra="forbid", use_enum_values=True)
@@ -40,6 +40,7 @@ class GenerationOperation(BaseModel):
     attempt_count: int = Field(default=0, ge=0)
     submission_count: Optional[int] = Field(default=None, ge=0)
     resume_count: Optional[int] = Field(default=None, ge=0)
+    accounting_complete: bool = False
     provider_request_id: Optional[str] = None
     artifact: Optional[Dict[str, Any]] = None
     last_error_code: Optional[str] = None
@@ -56,7 +57,11 @@ class GenerationOperation(BaseModel):
 
     @property
     def accounting_known(self) -> bool:
-        return self.submission_count is not None and self.resume_count is not None
+        return bool(
+            self.accounting_complete
+            and self.submission_count is not None
+            and self.resume_count is not None
+        )
 
 
 def _now_epoch() -> int:
@@ -107,13 +112,14 @@ def create_operation(
         provider=provider,
         submission_count=0,
         resume_count=0,
+        accounting_complete=True,
     )
     touch_operation(operation)
     return operation
 
 
 def _ensure_v3_accounting(operation: GenerationOperation) -> None:
-    """Start exact accounting from this point without inventing legacy history."""
+    """Start exact counters from now without inventing legacy history."""
 
     if operation.version < 3:
         operation.version = 3
@@ -121,6 +127,9 @@ def _ensure_v3_accounting(operation: GenerationOperation) -> None:
         operation.submission_count = 0
     if operation.resume_count is None:
         operation.resume_count = 0
+    # Do not set accounting_complete here. A legacy operation can start exact
+    # counters from this call onward while its earlier attempt history remains
+    # unknowable.
 
 
 def begin_submission(operation: GenerationOperation) -> None:
