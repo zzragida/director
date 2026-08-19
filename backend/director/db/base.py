@@ -61,6 +61,15 @@ class BaseDB(ABC):
         """
         pass
 
+    def current_epoch(self) -> int:
+        """Return authoritative database-server epoch seconds.
+
+        Production database implementations must override this method using the
+        database server clock. Keeping the contract on ``BaseDB`` lets lease
+        code depend on one clock source instead of application worker clocks.
+        """
+        raise NotImplementedError("database server time is not implemented")
+
     @abstractmethod
     def delete_session(self, session_id: str) -> Tuple[bool, List[str]]:
         """Delete a session and its optional associated data.
