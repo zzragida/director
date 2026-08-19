@@ -27,7 +27,7 @@ def export_digest(value: Any) -> str:
 
 
 class PortableSceneLineage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     index: int
     operation_id: Optional[str] = None
@@ -44,7 +44,7 @@ class PortableSceneLineage(BaseModel):
 
 
 class PortableAudioLineage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     operation_id: Optional[str] = None
     provider: Optional[str] = None
