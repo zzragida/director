@@ -4,10 +4,15 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from director.core.generation_accounting import (
+    GenerationCostSummary,
+    build_cost_summary,
+    load_rate_card_from_environment,
+)
 from director.core.generation_lifecycle import make_operation_id
 
 
-PROVENANCE_VERSION = 1
+PROVENANCE_VERSION = 2
 _REDACTED = "[REDACTED]"
 _SENSITIVE_KEYS = {
     "api_key",
@@ -124,6 +129,7 @@ class GenerationProvenanceManifest(BaseModel):
     scenes: List[SceneArtifactProvenance] = Field(default_factory=list)
     audio: Optional[AudioArtifactProvenance] = None
     final: Optional[FinalArtifactProvenance] = None
+    accounting: Optional[GenerationCostSummary] = None
     manifest_digest: Optional[str] = None
 
     def refresh_digest(self) -> None:
@@ -165,6 +171,7 @@ def create_provenance_manifest(
             audio_config=redact_generation_config(audio_config or {}),
         ),
     )
+    manifest.accounting = build_cost_summary(manifest)
     manifest.refresh_digest()
     return manifest
 
@@ -191,7 +198,7 @@ def sync_provenance_manifest(
     manifest: GenerationProvenanceManifest,
     checkpoint: Any,
 ) -> GenerationProvenanceManifest:
-    """Synchronize lineage from the authoritative checkpoint before persistence."""
+    """Synchronize lineage and accounting from the authoritative checkpoint."""
 
     video_config = redact_generation_config(manifest.request.video_config)
     scene_entries: List[SceneArtifactProvenance] = []
@@ -240,6 +247,9 @@ def sync_provenance_manifest(
             source_audio_artifact_id=manifest.audio.artifact_id,
         )
 
+    prior_rate_card = manifest.accounting.rate_card if manifest.accounting else None
+    rate_card = prior_rate_card or load_rate_card_from_environment()
+    manifest.accounting = build_cost_summary(manifest, rate_card=rate_card)
     manifest.version = PROVENANCE_VERSION
     manifest.refresh_digest()
     return manifest
@@ -250,6 +260,7 @@ def safe_provenance_summary(
 ) -> Dict[str, Any]:
     if manifest is None:
         return {}
+    accounting = manifest.accounting
     return {
         "manifest_id": manifest.manifest_id,
         "manifest_digest": manifest.manifest_digest,
@@ -258,4 +269,6 @@ def safe_provenance_summary(
         "persisted_scene_count": sum(1 for scene in manifest.scenes if scene.artifact_id),
         "audio_persisted": bool(manifest.audio and manifest.audio.artifact_id),
         "finalized": bool(manifest.final and manifest.final.stream_url),
+        "cost_known": bool(accounting and accounting.total_amount is not None),
+        "cost_currency": accounting.currency if accounting else None,
     }
