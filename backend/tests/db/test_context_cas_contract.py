@@ -62,9 +62,13 @@ def test_sqlite_context_cas_rejects_stale_existing_snapshot(tmp_path: Path):
 class FakeConnection:
     def __init__(self):
         self.commits = 0
+        self.closed = False
 
     def commit(self):
         self.commits += 1
+
+    def close(self):
+        self.closed = True
 
 
 class FakeCursor:
