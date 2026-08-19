@@ -9,9 +9,11 @@ on:
       - "backend/director/core/media_reference.py"
       - "backend/director/core/tool_contract.py"
       - "backend/director/core/tool_semantics.py"
+      - "backend/director/core/text_to_movie_contract.py"
       - "backend/director/agents/base.py"
       - "backend/director/agents/summarize_video.py"
       - "backend/director/agents/upload.py"
+      - "backend/director/agents/text_to_movie.py"
       - "backend/director/handler.py"
       - "backend/director/entrypoint/api/socket_io.py"
       - "backend/tests/db/**"
@@ -30,9 +32,11 @@ on:
       - "backend/director/core/media_reference.py"
       - "backend/director/core/tool_contract.py"
       - "backend/director/core/tool_semantics.py"
+      - "backend/director/core/text_to_movie_contract.py"
       - "backend/director/agents/base.py"
       - "backend/director/agents/summarize_video.py"
       - "backend/director/agents/upload.py"
+      - "backend/director/agents/text_to_movie.py"
       - "backend/director/handler.py"
       - "backend/director/entrypoint/api/socket_io.py"
       - "backend/tests/db/**"
@@ -77,7 +81,9 @@ jobs:
           backend/tests/core/test_media_reference_contract.py
           backend/tests/core/test_tool_contract.py
           backend/tests/core/test_tool_semantics.py
+          backend/tests/core/test_text_to_movie_contract.py
           backend/tests/agents/test_base_agent_tool_contract.py
           backend/tests/agents/test_agent_failure_contract.py
+          backend/tests/agents/test_text_to_movie_structured_contract.py
           backend/tests/handler/test_chat_agent_selection_contract.py
           backend/tests/entrypoint/test_chat_socket_contract.py
