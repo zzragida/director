@@ -144,8 +144,6 @@ class SQLiteDB(BaseDB):
                 self.conn.commit()
                 return False
 
-        # An observed empty document may mean the row is absent. Compete to
-        # create it without overwriting a peer that got there first.
         self.cursor.execute(
             """
             INSERT OR IGNORE INTO context_messages
@@ -157,6 +155,14 @@ class SQLiteDB(BaseDB):
         changed = self.cursor.rowcount > 0
         self.conn.commit()
         return changed
+
+    def current_epoch(self) -> int:
+        """Return epoch seconds from SQLite itself, not the worker clock."""
+        self.cursor.execute("SELECT CAST(strftime('%s', 'now') AS INTEGER)")
+        row = self.cursor.fetchone()
+        if row is None:
+            raise RuntimeError("SQLite did not return current epoch")
+        return int(row[0])
 
     def delete_conversation(self, session_id: str) -> bool:
         self.cursor.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
