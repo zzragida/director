@@ -2,7 +2,7 @@ import json
 import time
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 from director.constants import DBType
 from director.db.base import BaseDB
@@ -13,12 +13,9 @@ logger = logging.getLogger(__name__)
 
 class PostgresDB(BaseDB):
     def __init__(self):
-        """Initialize PostgreSQL connection using environment variables."""
-
         try:
             import psycopg2
             from psycopg2.extras import RealDictCursor
-
         except ImportError:
             raise ImportError("Please install psycopg2 library to use PostgreSQL.")
 
@@ -44,7 +41,6 @@ class PostgresDB(BaseDB):
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
-
         self.cursor.execute(
             """
             INSERT INTO sessions (session_id, video_id, collection_id, created_at, updated_at, metadata)
@@ -68,8 +64,7 @@ class PostgresDB(BaseDB):
         )
         row = self.cursor.fetchone()
         if row is not None:
-            session = dict(row)
-            return session
+            return dict(row)
         return {}
 
     def get_sessions(self) -> list:
@@ -94,7 +89,6 @@ class PostgresDB(BaseDB):
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
-
         self.cursor.execute(
             """
             INSERT INTO conversations (
@@ -135,12 +129,7 @@ class PostgresDB(BaseDB):
             (session_id,),
         )
         rows = self.cursor.fetchall()
-        conversations = []
-        for row in rows:
-            if row is not None:
-                conv_dict = dict(row)
-                conversations.append(conv_dict)
-        return conversations
+        return [dict(row) for row in rows if row is not None]
 
     def get_context_messages(self, session_id: str) -> list:
         self.cursor.execute(
@@ -161,7 +150,6 @@ class PostgresDB(BaseDB):
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
-
         self.cursor.execute(
             """
             INSERT INTO context_messages (context_data, session_id, created_at, updated_at, metadata)
@@ -181,6 +169,42 @@ class PostgresDB(BaseDB):
         )
         self.conn.commit()
 
+    def compare_and_swap_context_msg(
+        self,
+        session_id: str,
+        expected_context: Optional[dict],
+        context_messages: dict,
+    ) -> bool:
+        """Atomically update the JSONB context without overwriting a peer writer."""
+
+        now = int(time.time())
+        new_context = json.dumps(context_messages)
+
+        if expected_context is None:
+            self.cursor.execute(
+                """
+                INSERT INTO context_messages
+                    (context_data, session_id, created_at, updated_at, metadata)
+                VALUES (%s::jsonb, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (session_id) DO NOTHING
+                """,
+                (new_context, session_id, now, now, json.dumps({})),
+            )
+        else:
+            expected = json.dumps(expected_context)
+            self.cursor.execute(
+                """
+                UPDATE context_messages
+                SET context_data = %s::jsonb, updated_at = %s
+                WHERE session_id = %s AND context_data = %s::jsonb
+                """,
+                (new_context, now, session_id, expected),
+            )
+
+        changed = self.cursor.rowcount > 0
+        self.conn.commit()
+        return changed
+
     def delete_conversation(self, session_id: str) -> bool:
         self.cursor.execute(
             "DELETE FROM conversations WHERE session_id = %s", (session_id,)
@@ -196,21 +220,10 @@ class PostgresDB(BaseDB):
         return self.cursor.rowcount > 0
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session and any associated conversation/context rows.
-
-        Conversation and context rows are optional during the session lifecycle, so
-        their absence is not considered a deletion failure. The operation succeeds
-        only when the session row itself is deleted. Database errors still propagate.
-
-        :param str session_id: Unique session ID.
-        :return: Tuple of success flag and failed component names.
-        """
         self.delete_conversation(session_id)
         self.delete_context(session_id)
-
         self.cursor.execute("DELETE FROM sessions WHERE session_id = %s", (session_id,))
         self.conn.commit()
-
         session_deleted = self.cursor.rowcount > 0
         failed_components = [] if session_deleted else ["session"]
         return session_deleted, failed_components
@@ -225,12 +238,10 @@ class PostgresDB(BaseDB):
             """
             self.cursor.execute(query)
             table_count = self.cursor.fetchone()["count"]
-
             if table_count < 3:
                 logger.info("Tables not found. Initializing PostgreSQL DB...")
                 initialize_postgres()
             return True
-
         except Exception as e:
             logger.exception(f"PostgreSQL health check failed: {e}")
             return False
