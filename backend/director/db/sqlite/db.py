@@ -15,102 +15,64 @@ logger = logging.getLogger(__name__)
 
 class SQLiteDB(BaseDB):
     def __init__(self, db_path: str = None):
-        """
-        :param db_path: Path to the SQLite database file.
-        """
         self.db_type = DBType.SQLITE
-        if db_path is None:
-            self.db_path = os.getenv("SQLITE_DB_PATH", "director.db")
-        else:
-            self.db_path = db_path
+        self.db_path = db_path or os.getenv("SQLITE_DB_PATH", "director.db")
         self.conn = sqlite3.connect(self.db_path, check_same_thread=True)
         self.conn.row_factory = sqlite3.Row
         self.cursor = self.conn.cursor()
         logger.info("Connected to SQLite DB...")
 
     def create_session(
-        self,
-        session_id: str,
-        video_id: str,
-        collection_id: str,
-        created_at: int = None,
-        updated_at: int = None,
-        metadata: dict = {},
-        **kwargs,
+        self, session_id: str, video_id: str, collection_id: str,
+        created_at: int = None, updated_at: int = None,
+        metadata: dict = {}, **kwargs,
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
-
         self.cursor.execute(
             """
-        INSERT OR IGNORE INTO sessions (session_id, video_id, collection_id, created_at, updated_at, metadata)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-            (
-                session_id,
-                video_id,
-                collection_id,
-                created_at,
-                updated_at,
-                json.dumps(metadata),
-            ),
+            INSERT OR IGNORE INTO sessions
+                (session_id, video_id, collection_id, created_at, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, video_id, collection_id, created_at, updated_at, json.dumps(metadata)),
         )
         self.conn.commit()
 
     def get_session(self, session_id: str) -> dict:
-        self.cursor.execute(
-            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
-        )
+        self.cursor.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
         row = self.cursor.fetchone()
-        if row is not None:
-            session = dict(row)
-            session["metadata"] = json.loads(session["metadata"])
-            return session
-        return {}
+        if row is None:
+            return {}
+        session = dict(row)
+        session["metadata"] = json.loads(session["metadata"])
+        return session
 
     def get_sessions(self) -> list:
         self.cursor.execute("SELECT * FROM sessions ORDER BY updated_at DESC")
-        row = self.cursor.fetchall()
-        sessions = [dict(r) for r in row]
-        for s in sessions:
-            s["metadata"] = json.loads(s["metadata"])
+        sessions = [dict(r) for r in self.cursor.fetchall()]
+        for session in sessions:
+            session["metadata"] = json.loads(session["metadata"])
         return sessions
 
     def add_or_update_msg_to_conv(
-        self,
-        session_id: str,
-        conv_id: str,
-        msg_id: str,
-        msg_type: str,
-        agents: List[str],
-        actions: List[str],
-        content: List[dict],
-        status: str = None,
-        created_at: int = None,
-        updated_at: int = None,
-        metadata: dict = {},
-        **kwargs,
+        self, session_id: str, conv_id: str, msg_id: str, msg_type: str,
+        agents: List[str], actions: List[str], content: List[dict], status: str = None,
+        created_at: int = None, updated_at: int = None, metadata: dict = {}, **kwargs,
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
-
         self.cursor.execute(
             """
-        INSERT OR REPLACE INTO conversations (session_id, conv_id, msg_id, msg_type, agents, actions, content, status, created_at, updated_at, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+            INSERT OR REPLACE INTO conversations
+                (session_id, conv_id, msg_id, msg_type, agents, actions, content,
+                 status, created_at, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
-                session_id,
-                conv_id,
-                msg_id,
-                msg_type,
-                json.dumps(agents),
-                json.dumps(actions),
-                json.dumps(content),
-                status,
-                created_at,
-                updated_at,
-                json.dumps(metadata),
+                session_id, conv_id, msg_id, msg_type, json.dumps(agents),
+                json.dumps(actions), json.dumps(content), status, created_at,
+                updated_at, json.dumps(metadata),
             ),
         )
         self.conn.commit()
@@ -120,16 +82,14 @@ class SQLiteDB(BaseDB):
             "SELECT * FROM conversations WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,),
         )
-        rows = self.cursor.fetchall()
         conversations = []
-        for row in rows:
-            if row is not None:
-                conv_dict = dict(row)
-                conv_dict["agents"] = json.loads(conv_dict["agents"])
-                conv_dict["actions"] = json.loads(conv_dict["actions"])
-                conv_dict["content"] = json.loads(conv_dict["content"])
-                conv_dict["metadata"] = json.loads(conv_dict["metadata"])
-                conversations.append(conv_dict)
+        for row in self.cursor.fetchall():
+            conv = dict(row)
+            conv["agents"] = json.loads(conv["agents"])
+            conv["actions"] = json.loads(conv["actions"])
+            conv["content"] = json.loads(conv["content"])
+            conv["metadata"] = json.loads(conv["metadata"])
+            conversations.append(conv)
         return conversations
 
     def get_context_messages(self, session_id: str) -> list:
@@ -141,29 +101,19 @@ class SQLiteDB(BaseDB):
         return json.loads(result[0]) if result else {}
 
     def add_or_update_context_msg(
-        self,
-        session_id: str,
-        context_messages: list,
-        created_at: int = None,
-        updated_at: int = None,
-        metadata: dict = {},
-        **kwargs,
+        self, session_id: str, context_messages: list,
+        created_at: int = None, updated_at: int = None,
+        metadata: dict = {}, **kwargs,
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
-
         self.cursor.execute(
             """
-        INSERT OR REPLACE INTO context_messages (context_data, session_id, created_at, updated_at, metadata)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-            (
-                json.dumps(context_messages),
-                session_id,
-                created_at,
-                updated_at,
-                json.dumps(metadata),
-            ),
+            INSERT OR REPLACE INTO context_messages
+                (context_data, session_id, created_at, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (json.dumps(context_messages), session_id, created_at, updated_at, json.dumps(metadata)),
         )
         self.conn.commit()
 
@@ -173,21 +123,11 @@ class SQLiteDB(BaseDB):
         expected_context: Optional[dict],
         context_messages: dict,
     ) -> bool:
-        """Atomically update the session context without overwriting a peer writer."""
-
+        """Atomically replace context only when the observed document is unchanged."""
         now = int(time.time())
         new_context = json.dumps(context_messages)
 
-        if expected_context is None:
-            self.cursor.execute(
-                """
-                INSERT OR IGNORE INTO context_messages
-                    (context_data, session_id, created_at, updated_at, metadata)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (new_context, session_id, now, now, json.dumps({})),
-            )
-        else:
+        if expected_context is not None:
             expected = json.dumps(expected_context)
             self.cursor.execute(
                 """
@@ -197,48 +137,55 @@ class SQLiteDB(BaseDB):
                 """,
                 (new_context, now, session_id, expected),
             )
+            if self.cursor.rowcount > 0:
+                self.conn.commit()
+                return True
+            if expected_context != {}:
+                self.conn.commit()
+                return False
 
+        # An observed empty document may mean the row is absent. Compete to
+        # create it without overwriting a peer that got there first.
+        self.cursor.execute(
+            """
+            INSERT OR IGNORE INTO context_messages
+                (context_data, session_id, created_at, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (new_context, session_id, now, now, json.dumps({})),
+        )
         changed = self.cursor.rowcount > 0
         self.conn.commit()
         return changed
 
     def delete_conversation(self, session_id: str) -> bool:
-        self.cursor.execute(
-            "DELETE FROM conversations WHERE session_id = ?", (session_id,)
-        )
+        self.cursor.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
         self.conn.commit()
         return self.cursor.rowcount > 0
 
     def delete_context(self, session_id: str) -> bool:
-        self.cursor.execute(
-            "DELETE FROM context_messages WHERE session_id = ?", (session_id,)
-        )
+        self.cursor.execute("DELETE FROM context_messages WHERE session_id = ?", (session_id,))
         self.conn.commit()
         return self.cursor.rowcount > 0
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session and any associated conversation/context rows."""
         self.delete_conversation(session_id)
         self.delete_context(session_id)
-
         self.cursor.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         self.conn.commit()
-
         session_deleted = self.cursor.rowcount > 0
-        failed_components = [] if session_deleted else ["session"]
-        return session_deleted, failed_components
+        return session_deleted, [] if session_deleted else ["session"]
 
     def health_check(self) -> bool:
         try:
-            query = """
-                SELECT COUNT(name)
-                FROM sqlite_master
+            self.cursor.execute(
+                """
+                SELECT COUNT(name) FROM sqlite_master
                 WHERE type='table'
                 AND name IN ('sessions', 'conversations', 'context_messages');
-            """
-            self.cursor.execute(query)
-            table_count = self.cursor.fetchone()[0]
-            if table_count < 3:
+                """
+            )
+            if self.cursor.fetchone()[0] < 3:
                 logger.info("Tables not found. Initializing SQLite DB...")
                 initialize_sqlite(self.db_path)
             return True
