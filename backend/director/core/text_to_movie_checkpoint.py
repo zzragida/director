@@ -11,6 +11,26 @@ CHECKPOINT_CONTEXT_KEY = "__text_to_movie_checkpoints__"
 CHECKPOINT_VERSION = 1
 
 
+class TextToMovieExecutionError(RuntimeError):
+    """Safe typed failure for resumable Text-to-Movie execution."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        code: str,
+        message: str,
+        scene_index: Optional[int] = None,
+        resumable: bool = True,
+    ):
+        super().__init__(message)
+        self.stage = stage
+        self.code = code
+        self.message = message
+        self.scene_index = scene_index
+        self.resumable = resumable
+
+
 class SceneCheckpoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
