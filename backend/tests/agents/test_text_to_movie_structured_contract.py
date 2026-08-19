@@ -150,9 +150,11 @@ def valid_visual_style():
 
 
 def load_text_to_movie_module(monkeypatch):
+    videodb_module = types.ModuleType("videodb")
     asset_module = types.ModuleType("videodb.asset")
     asset_module.VideoAsset = DummyAsset
     asset_module.AudioAsset = DummyAsset
+    videodb_module.asset = asset_module
 
     base_module = types.ModuleType("director.agents.base")
     base_module.BaseAgent = BaseAgent
@@ -190,6 +192,7 @@ def load_text_to_movie_module(monkeypatch):
     constants_module = types.ModuleType("director.constants")
     constants_module.DOWNLOADS_PATH = "/tmp/director-contract-tests"
 
+    monkeypatch.setitem(sys.modules, "videodb", videodb_module)
     monkeypatch.setitem(sys.modules, "videodb.asset", asset_module)
     monkeypatch.setitem(sys.modules, "director.agents.base", base_module)
     monkeypatch.setitem(sys.modules, "director.core.session", session_module)
