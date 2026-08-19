@@ -19,6 +19,8 @@ from director.core.generation_lifecycle import (
 from director.core.generation_provenance import (
     GenerationProvenanceManifest,
     create_provenance_manifest,
+    redact_generation_config,
+    stable_digest,
     sync_provenance_manifest,
 )
 from director.core.session import ContextMessage, RoleTypes
@@ -26,6 +28,7 @@ from director.core.session import ContextMessage, RoleTypes
 
 CHECKPOINT_CONTEXT_KEY = "__text_to_movie_checkpoints__"
 CHECKPOINT_VERSION = 6
+ACTIVE_AGENT_CALL_STATE_KEY = "__active_agent_call__"
 
 
 class CheckpointConflictError(RuntimeError):
@@ -311,6 +314,57 @@ class TextToMovieCheckpointStore:
             return checkpoint.audio_operation.provider
         return None
 
+    def _active_text_to_movie_arguments(self) -> Optional[Dict[str, Any]]:
+        state = getattr(self.session, "state", None)
+        if not isinstance(state, dict):
+            return None
+        active = state.get(ACTIVE_AGENT_CALL_STATE_KEY)
+        if not isinstance(active, dict) or active.get("agent_name") != "text_to_movie":
+            return None
+        arguments = active.get("arguments")
+        return arguments if isinstance(arguments, dict) else None
+
+    def _enrich_request_provenance(self, checkpoint: TextToMovieCheckpoint) -> None:
+        if checkpoint.provenance is None:
+            return
+        arguments = self._active_text_to_movie_arguments()
+        if not arguments:
+            return
+
+        request = checkpoint.provenance.request
+        payload = arguments.get("text_to_movie")
+        payload = payload if isinstance(payload, dict) else {}
+        engine = arguments.get("engine")
+        audio_engine = arguments.get("audio_engine", "videodb")
+        storyline = payload.get("storyline")
+
+        if request.collection_id is None and arguments.get("collection_id"):
+            request.collection_id = str(arguments.get("collection_id"))
+        if request.storyline is None and isinstance(storyline, str) and storyline.strip():
+            request.storyline = storyline.strip()
+            request.storyline_digest = stable_digest(request.storyline)
+        if request.video_provider is None and engine:
+            request.video_provider = str(engine)
+        if request.audio_provider is None and audio_engine:
+            request.audio_provider = str(audio_engine)
+
+        if not request.video_config:
+            video_config_key = (
+                "video_stabilityai_config"
+                if engine == "stabilityai"
+                else "video_kling_config"
+                if engine == "kling"
+                else None
+            )
+            if video_config_key:
+                config = payload.get(video_config_key)
+                if isinstance(config, dict):
+                    request.video_config = redact_generation_config(config)
+        if not request.audio_config and audio_engine == "elevenlabs":
+            config = payload.get("audio_elevenlabs_config")
+            if isinstance(config, dict):
+                request.audio_config = redact_generation_config(config)
+
     def _sync_provenance(self, checkpoint: TextToMovieCheckpoint) -> None:
         if not checkpoint.generation_run_id:
             checkpoint.generation_run_id = make_generation_run_id(
@@ -324,6 +378,7 @@ class TextToMovieCheckpointStore:
                 video_provider=self._infer_provider(checkpoint, "video"),
                 audio_provider=self._infer_provider(checkpoint, "audio"),
             )
+        self._enrich_request_provenance(checkpoint)
         sync_provenance_manifest(checkpoint.provenance, checkpoint)
 
     def save(
