@@ -16,6 +16,7 @@ on:
       - "backend/director/core/generation_lifecycle.py"
       - "backend/director/core/generation_reconciliation.py"
       - "backend/director/core/generation_lease.py"
+      - "backend/director/core/generation_provenance.py"
       - "backend/director/tools/kling.py"
       - "backend/director/tools/stabilityai.py"
       - "backend/director/agents/base.py"
@@ -47,6 +48,7 @@ on:
       - "backend/director/core/generation_lifecycle.py"
       - "backend/director/core/generation_reconciliation.py"
       - "backend/director/core/generation_lease.py"
+      - "backend/director/core/generation_provenance.py"
       - "backend/director/tools/kling.py"
       - "backend/director/tools/stabilityai.py"
       - "backend/director/agents/base.py"
@@ -94,6 +96,7 @@ jobs:
           backend/director/core/generation_lifecycle.py
           backend/director/core/generation_reconciliation.py
           backend/director/core/generation_lease.py
+          backend/director/core/generation_provenance.py
           backend/director/core/text_to_movie_checkpoint.py
           backend/director/tools/kling.py
           backend/director/tools/stabilityai.py
@@ -115,9 +118,11 @@ jobs:
           backend/tests/core/test_tool_semantics.py
           backend/tests/core/test_text_to_movie_contract.py
           backend/tests/core/test_text_to_movie_checkpoint.py
+          backend/tests/core/test_text_to_movie_provenance_checkpoint.py
           backend/tests/core/test_generation_lifecycle.py
           backend/tests/core/test_generation_reconciliation.py
           backend/tests/core/test_generation_lease.py
+          backend/tests/core/test_generation_provenance.py
           backend/tests/agents/test_base_agent_tool_contract.py
           backend/tests/agents/test_agent_failure_contract.py
           backend/tests/agents/test_text_to_movie_structured_contract.py
