@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import sys
@@ -26,11 +27,19 @@ class FakeDB:
         self.write_count = 0
 
     def get_context_messages(self, session_id):
-        return self.context.get(session_id, {})
+        return copy.deepcopy(self.context.get(session_id, {}))
 
     def add_or_update_context_msg(self, session_id, context):
         self.write_count += 1
-        self.context[session_id] = context
+        self.context[session_id] = copy.deepcopy(context)
+
+    def compare_and_swap_context_msg(self, session_id, expected_context, context_messages):
+        current = self.context.get(session_id, {})
+        if current != expected_context:
+            return False
+        self.context[session_id] = copy.deepcopy(context_messages)
+        self.write_count += 1
+        return True
 
 
 class FakeSession:
@@ -140,6 +149,7 @@ def test_checkpoint_store_persists_and_preserves_existing_context(monkeypatch):
     assert checkpoint.CHECKPOINT_CONTEXT_KEY in persisted
     assert checkpoint.CHECKPOINT_CONTEXT_KEY in session.agent_context
     assert db.write_count == 1
+    assert value.revision == 1
 
     resumed_session = FakeSession(db)
     resumed = checkpoint.TextToMovieCheckpointStore(resumed_session).get(
@@ -150,6 +160,7 @@ def test_checkpoint_store_persists_and_preserves_existing_context(monkeypatch):
     assert resumed.request_fingerprint == fingerprint
     assert resumed.completed_scene_count == 1
     assert resumed.scenes[0].media["id"] == "video-1"
+    assert resumed.revision == 1
 
 
 def test_checkpoint_store_keeps_multiple_request_fingerprints(monkeypatch):
@@ -186,6 +197,41 @@ def test_checkpoint_store_keeps_multiple_request_fingerprints(monkeypatch):
 
     assert store.get(first.checkpoint_id).request_fingerprint == first_fingerprint
     assert store.get(second.checkpoint_id).request_fingerprint == second_fingerprint
+
+
+def test_stale_checkpoint_revision_cannot_overwrite_newer_progress(monkeypatch):
+    checkpoint = load_checkpoint_module(monkeypatch)
+    db = FakeDB()
+    store = checkpoint.TextToMovieCheckpointStore(FakeSession(db))
+
+    fingerprint = checkpoint.build_request_fingerprint(
+        collection_id="collection-1",
+        engine="videodb",
+        audio_engine="videodb",
+        storyline="A quiet reunion",
+    )
+    value = checkpoint.create_checkpoint(
+        request_fingerprint=fingerprint,
+        visual_style={"camera_setup": "35mm"},
+        scenes=sample_scenes(),
+    )
+    store.save(value)
+
+    winner = store.get(value.checkpoint_id)
+    stale = store.get(value.checkpoint_id)
+    winner.status = "generating"
+    winner.scenes[0].status = "complete"
+    winner.scenes[0].media = {"id": "scene-1", "length": 4}
+    store.save(winner)
+
+    stale.status = "failed"
+    with pytest.raises(checkpoint.CheckpointConflictError):
+        store.save(stale)
+
+    persisted = store.get(value.checkpoint_id)
+    assert persisted.revision == 2
+    assert persisted.status == "generating"
+    assert persisted.scenes[0].media["id"] == "scene-1"
 
 
 def test_compact_media_requires_stable_id(monkeypatch):
