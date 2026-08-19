@@ -162,6 +162,16 @@ class PostgresDB(BaseDB):
         self.conn.commit()
         return changed
 
+    def current_epoch(self) -> int:
+        """Return epoch seconds from the Postgres server clock."""
+        self.cursor.execute(
+            "SELECT CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT) AS epoch"
+        )
+        row = self.cursor.fetchone()
+        if row is None or row.get("epoch") is None:
+            raise RuntimeError("Postgres did not return current epoch")
+        return int(row["epoch"])
+
     def delete_conversation(self, session_id: str) -> bool:
         self.cursor.execute("DELETE FROM conversations WHERE session_id = %s", (session_id,))
         self.conn.commit()
