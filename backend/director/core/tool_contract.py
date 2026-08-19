@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Any, Dict, List
 
 
@@ -9,6 +10,36 @@ class ToolArgumentValidationError(ValueError):
     def __init__(self, details: List[dict]):
         super().__init__("Invalid agent tool arguments")
         self.details = details
+
+
+# Known schema/runtime mismatches are patched here so the same effective contract
+# is advertised to the LLM and enforced immediately before execution.
+RUNTIME_SCHEMA_PATCHES = {
+    "text_to_movie": {
+        "required": ["text_to_movie"],
+        "min_length_paths": [("text_to_movie", "storyline")],
+    }
+}
+
+
+def get_effective_tool_schema(agent_name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+    effective = deepcopy(schema or {"type": "object"})
+    patch = RUNTIME_SCHEMA_PATCHES.get(agent_name)
+    if not patch:
+        return effective
+
+    required = effective.setdefault("required", [])
+    for field_name in patch.get("required", []):
+        if field_name not in required:
+            required.append(field_name)
+
+    for path in patch.get("min_length_paths", []):
+        current = effective
+        for field_name in path:
+            current = current.setdefault("properties", {}).setdefault(field_name, {})
+        current.setdefault("minLength", 1)
+
+    return effective
 
 
 def _matches_type(value: Any, expected_type: str) -> bool:
