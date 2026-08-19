@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import sys
@@ -69,10 +70,17 @@ class FakeDB:
         self.context = {}
 
     def get_context_messages(self, session_id):
-        return self.context.get(session_id, {})
+        return copy.deepcopy(self.context.get(session_id, {}))
 
     def add_or_update_context_msg(self, session_id, context):
-        self.context[session_id] = context
+        self.context[session_id] = copy.deepcopy(context)
+
+    def compare_and_swap_context_msg(self, session_id, expected_context, context_messages):
+        current = self.context.get(session_id, {})
+        if current != expected_context:
+            return False
+        self.context[session_id] = copy.deepcopy(context_messages)
+        return True
 
 
 class FakeSession:
@@ -113,6 +121,19 @@ class FakeVideoDBTool:
     def upload(self, *args, **kwargs):
         FakeVideoDBTool.upload_calls += 1
         return {"id": "uploaded", "length": 1}
+
+    def get_videos(self):
+        return []
+
+    def get_audios(self):
+        return []
+
+    def get_and_set_timeline(self):
+        return types.SimpleNamespace(
+            add_inline=lambda *args, **kwargs: None,
+            add_overlay=lambda *args, **kwargs: None,
+            generate_stream=lambda: "https://stream.example/final.m3u8",
+        )
 
 
 class FakeVideoGenerationTool:
@@ -218,16 +239,9 @@ def load_text_to_movie_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "director.tools.elevenlabs", elevenlabs_module)
     monkeypatch.setitem(sys.modules, "director.tools.videodb_tool", videodb_tool_module)
     monkeypatch.setitem(sys.modules, "director.constants", constants_module)
-
-    # Ensure the checkpoint module binds to the stubbed session contract.
     sys.modules.pop("director.core.text_to_movie_checkpoint", None)
 
-    agent_path = (
-        Path(__file__).resolve().parents[2]
-        / "director"
-        / "agents"
-        / "text_to_movie.py"
-    )
+    agent_path = Path(__file__).resolve().parents[2] / "director" / "agents" / "text_to_movie.py"
     spec = importlib.util.spec_from_file_location(
         "director_text_to_movie_structured_contract_test", agent_path
     )
@@ -264,7 +278,6 @@ def test_invalid_visual_style_stops_before_media_generation(monkeypatch):
         module,
         FakeLLM([FakeLLMResponse(content="not-json")]),
     )
-
     response = agent.run(
         collection_id="collection-1",
         engine="videodb",
@@ -272,7 +285,6 @@ def test_invalid_visual_style_stops_before_media_generation(monkeypatch):
         job_type="text_to_movie",
         text_to_movie={"storyline": "A quiet reunion"},
     )
-
     assert response.status == AgentStatus.ERROR
     assert response.data["error"] == "structured_generation_failed"
     assert response.data["stage"] == "visual_style"
@@ -295,7 +307,6 @@ def test_invalid_scene_sequence_stops_before_media_generation(monkeypatch):
             ]
         ),
     )
-
     response = agent.run(
         collection_id="collection-1",
         engine="videodb",
@@ -303,7 +314,6 @@ def test_invalid_scene_sequence_stops_before_media_generation(monkeypatch):
         job_type="text_to_movie",
         text_to_movie={"storyline": "A quiet reunion"},
     )
-
     assert response.status == AgentStatus.ERROR
     assert response.data["stage"] == "scene_sequence"
     assert response.data["code"] == "invalid_structure"
@@ -316,7 +326,6 @@ def test_storyline_validation_stops_before_tool_initialization(monkeypatch):
     reset_side_effect_counters()
     module = load_text_to_movie_module(monkeypatch)
     agent, _ = make_agent(module, FakeLLM([]))
-
     response = agent.run(
         collection_id="collection-1",
         engine="videodb",
@@ -324,7 +333,6 @@ def test_storyline_validation_stops_before_tool_initialization(monkeypatch):
         job_type="text_to_movie",
         text_to_movie={"storyline": "   "},
     )
-
     assert response.status == AgentStatus.ERROR
     assert response.data["stage"] == "input"
     assert response.data["code"] == "invalid_storyline"

@@ -49,6 +49,11 @@ class StabilityAITool:
         self.result_endpoint = "https://api.stability.ai/v2beta/image-to-video/result"
         self.polling_interval = 10
 
+    @staticmethod
+    def _heartbeat(callback):
+        if callback is not None:
+            callback()
+
     def text_to_video(
         self,
         prompt: str,
@@ -56,14 +61,10 @@ class StabilityAITool:
         duration: float,
         config: dict,
         on_request_id=None,
+        on_heartbeat=None,
     ):
-        """Submit Stability image-to-video work and download it when complete.
-
-        The provider generation ID is surfaced through ``on_request_id`` as
-        soon as it is known so the caller can durably checkpoint it before the
-        potentially long polling/download phase.
-        """
-
+        """Submit Stability image-to-video work and download it when complete."""
+        self._heartbeat(on_heartbeat)
         headers = {
             "authorization": f"Bearer {self.api_key}",
             "accept": "image/*",
@@ -83,6 +84,7 @@ class StabilityAITool:
         if image_response.status_code != 200:
             raise Exception("Stability image generation failed")
 
+        self._heartbeat(on_heartbeat)
         image = Image.open(io.BytesIO(image_response.content))
         new_width = 1024
         new_height = int(new_width * (576 / 1024))
@@ -97,6 +99,7 @@ class StabilityAITool:
                 "cfg_scale": config.get("cfg_scale", 1.8),
                 "motion_bucket_id": config.get("motion_bucket_id", 127),
             }
+            self._heartbeat(on_heartbeat)
             with open(temp_image_path, "rb") as img_file:
                 video_response = requests.post(
                     self.video_endpoint,
@@ -113,20 +116,29 @@ class StabilityAITool:
 
             if on_request_id is not None:
                 on_request_id(str(generation_id))
-
-            return self.resume_text_to_video(str(generation_id), save_at)
+            self._heartbeat(on_heartbeat)
+            return self.resume_text_to_video(
+                str(generation_id),
+                save_at,
+                on_heartbeat=on_heartbeat,
+            )
         finally:
             if os.path.exists(temp_image_path):
                 os.remove(temp_image_path)
 
-    def resume_text_to_video(self, request_id: str, save_at: str):
+    def resume_text_to_video(
+        self,
+        request_id: str,
+        save_at: str,
+        on_heartbeat=None,
+    ):
         """Resume polling/downloading an already submitted Stability job."""
-
         headers = {
             "accept": "video/*",
             "authorization": f"Bearer {self.api_key}",
         }
         while True:
+            self._heartbeat(on_heartbeat)
             result_response = requests.get(
                 f"{self.result_endpoint}/{request_id}",
                 headers=headers,
@@ -135,6 +147,7 @@ class StabilityAITool:
                 time.sleep(self.polling_interval)
                 continue
             if result_response.status_code == 200:
+                self._heartbeat(on_heartbeat)
                 with open(save_at, "wb") as file:
                     file.write(result_response.content)
                 return None

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from director.core.context_cas import atomic_update_context
 from director.core.generation_lifecycle import (
     GenerationOperation,
     create_operation,
@@ -13,7 +14,11 @@ from director.core.session import ContextMessage, RoleTypes
 
 
 CHECKPOINT_CONTEXT_KEY = "__text_to_movie_checkpoints__"
-CHECKPOINT_VERSION = 3
+CHECKPOINT_VERSION = 4
+
+
+class CheckpointConflictError(RuntimeError):
+    """Raised when a stale checkpoint attempts to overwrite newer progress."""
 
 
 class TextToMovieExecutionError(RuntimeError):
@@ -55,6 +60,7 @@ class TextToMovieCheckpoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int = CHECKPOINT_VERSION
+    revision: int = Field(default=0, ge=0)
     checkpoint_id: str
     request_fingerprint: str
     generation_run_id: Optional[str] = None
@@ -78,8 +84,6 @@ class TextToMovieCheckpoint(BaseModel):
         )
 
     def ensure_lifecycle(self, *, video_provider: str, audio_provider: str) -> bool:
-        """Backfill deterministic operation IDs for new or legacy checkpoints."""
-
         changed = False
         if not self.generation_run_id:
             self.generation_run_id = make_generation_run_id(self.request_fingerprint)
@@ -140,8 +144,6 @@ def build_request_fingerprint(
     video_config: Optional[dict] = None,
     audio_config: Optional[dict] = None,
 ) -> str:
-    """Return a deterministic fingerprint for resumable Text-to-Movie work."""
-
     payload = {
         "collection_id": collection_id,
         "engine": engine,
@@ -172,12 +174,10 @@ def create_checkpoint(
     video_provider: Optional[str] = None,
     audio_provider: Optional[str] = None,
 ) -> TextToMovieCheckpoint:
-    checkpoint_id = make_checkpoint_id(request_fingerprint)
-    generation_run_id = make_generation_run_id(request_fingerprint)
     checkpoint = TextToMovieCheckpoint(
-        checkpoint_id=checkpoint_id,
+        checkpoint_id=make_checkpoint_id(request_fingerprint),
         request_fingerprint=request_fingerprint,
-        generation_run_id=generation_run_id,
+        generation_run_id=make_generation_run_id(request_fingerprint),
         visual_style=visual_style,
         scenes=[
             SceneCheckpoint(index=index, plan=scene)
@@ -193,11 +193,8 @@ def create_checkpoint(
 
 
 def compact_media(media: Any) -> Dict[str, Any]:
-    """Persist only stable media fields needed for resume/composition."""
-
     if not isinstance(media, dict):
         raise ValueError("media result must be an object")
-
     media_id = media.get("id")
     if not media_id:
         raise ValueError("media result is missing id")
@@ -211,23 +208,17 @@ def compact_media(media: Any) -> Dict[str, Any]:
 
 
 class TextToMovieCheckpointStore:
-    """Persist resumable checkpoints inside the existing session context JSON.
+    """CAS-backed checkpoint store inside the existing session context JSON."""
 
-    The database context row is merged in place so a checkpoint written after a
-    scene completes does not wait for the final reasoning save. A mirrored
-    ContextMessage is also placed in ``session.agent_context`` so the normal
-    Session.save_context_messages() path keeps the checkpoint on later saves.
-    """
-
-    def __init__(self, session):
+    def __init__(self, session, *, max_cas_attempts: int = 8):
         self.session = session
+        self.max_cas_attempts = max_cas_attempts
 
-    def _read_document(self) -> Dict[str, dict]:
-        context = self.session.db.get_context_messages(self.session.session_id) or {}
+    @staticmethod
+    def _read_document_from_context(context: Dict) -> Dict[str, dict]:
         messages = context.get(CHECKPOINT_CONTEXT_KEY, [])
         if not messages:
             return {}
-
         content = (
             messages[-1].get("content")
             if isinstance(messages[-1], dict)
@@ -235,12 +226,15 @@ class TextToMovieCheckpointStore:
         )
         if not isinstance(content, str) or not content:
             return {}
-
         try:
             document = json.loads(content)
         except (TypeError, json.JSONDecodeError):
             return {}
         return document if isinstance(document, dict) else {}
+
+    def _read_document(self) -> Dict[str, dict]:
+        context = self.session.db.get_context_messages(self.session.session_id) or {}
+        return self._read_document_from_context(context)
 
     def get(self, checkpoint_id: str) -> Optional[TextToMovieCheckpoint]:
         raw = self._read_document().get(checkpoint_id)
@@ -252,18 +246,53 @@ class TextToMovieCheckpointStore:
             return None
 
     def save(self, checkpoint: TextToMovieCheckpoint) -> None:
-        document = self._read_document()
-        document[checkpoint.checkpoint_id] = checkpoint.model_dump(mode="json")
-        content = json.dumps(
-            document,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
+        expected_revision = checkpoint.revision
+        next_revision = expected_revision + 1
+        stored = checkpoint.model_copy(deep=True)
+        stored.revision = next_revision
+        stored.version = CHECKPOINT_VERSION
+        message_holder = {}
+        conflict_reason = None
+
+        def mutate(context: Dict) -> Optional[Dict]:
+            nonlocal conflict_reason
+            document = self._read_document_from_context(context)
+            raw_current = document.get(checkpoint.checkpoint_id)
+
+            if raw_current is None:
+                if expected_revision != 0:
+                    conflict_reason = "checkpoint_missing_after_prior_write"
+                    return None
+            else:
+                current_revision = int(raw_current.get("revision", 0))
+                if current_revision != expected_revision:
+                    conflict_reason = "checkpoint_revision_conflict"
+                    return None
+
+            document[checkpoint.checkpoint_id] = stored.model_dump(mode="json")
+            content = json.dumps(
+                document,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+            message = ContextMessage(content=content, role=RoleTypes.system)
+            message_holder["message"] = message
+            context[CHECKPOINT_CONTEXT_KEY] = [message.to_llm_msg()]
+            return context
+
+        atomic_update_context(
+            self.session.db,
+            self.session.session_id,
+            mutate,
+            max_attempts=self.max_cas_attempts,
         )
-        message = ContextMessage(content=content, role=RoleTypes.system)
 
-        self.session.agent_context[CHECKPOINT_CONTEXT_KEY] = [message]
+        if conflict_reason:
+            raise CheckpointConflictError(conflict_reason)
 
-        context = self.session.db.get_context_messages(self.session.session_id) or {}
-        context[CHECKPOINT_CONTEXT_KEY] = [message.to_llm_msg()]
-        self.session.db.add_or_update_context_msg(self.session.session_id, context)
+        checkpoint.revision = next_revision
+        checkpoint.version = CHECKPOINT_VERSION
+        message = message_holder.get("message")
+        if message is not None:
+            self.session.agent_context[CHECKPOINT_CONTEXT_KEY] = [message]

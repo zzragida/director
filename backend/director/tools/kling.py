@@ -35,12 +35,8 @@ PARAMS_CONFIG = {
                     "type": "string",
                     "description": "Type of camera movement",
                     "enum": [
-                        "simple",
-                        "none",
-                        "down_back",
-                        "forward_up",
-                        "right_turn_forward",
-                        "left_turn_forward",
+                        "simple", "none", "down_back", "forward_up",
+                        "right_turn_forward", "left_turn_forward",
                     ],
                     "default": "none",
                 },
@@ -78,6 +74,11 @@ class KlingAITool:
         }
         return jwt.encode(payload, self.secret_key, headers=headers)
 
+    @staticmethod
+    def _heartbeat(callback):
+        if callback is not None:
+            callback()
+
     def text_to_video(
         self,
         prompt: str,
@@ -85,14 +86,10 @@ class KlingAITool:
         duration: float,
         config: dict,
         on_request_id=None,
+        on_heartbeat=None,
     ):
-        """Submit a Kling task and download it when complete.
-
-        ``on_request_id`` is invoked immediately after Kling returns ``task_id``.
-        Persisting that ID lets the caller resume polling after a later failure
-        without submitting a second generation request.
-        """
-
+        """Submit a Kling task and download it when complete."""
+        self._heartbeat(on_heartbeat)
         api_key = self.get_authorization_token()
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -115,17 +112,26 @@ class KlingAITool:
 
         if on_request_id is not None:
             on_request_id(str(job_id))
+        self._heartbeat(on_heartbeat)
+        return self.resume_text_to_video(
+            str(job_id),
+            save_at,
+            on_heartbeat=on_heartbeat,
+        )
 
-        return self.resume_text_to_video(str(job_id), save_at)
-
-    def resume_text_to_video(self, request_id: str, save_at: str):
+    def resume_text_to_video(
+        self,
+        request_id: str,
+        save_at: str,
+        on_heartbeat=None,
+    ):
         """Resume polling/downloading an already submitted Kling task."""
-
         api_key = self.get_authorization_token()
         result_endpoint = f"{self.api_route}/v1/videos/text2video/{request_id}"
         headers = {"Authorization": f"Bearer {api_key}"}
 
         while True:
+            self._heartbeat(on_heartbeat)
             response = requests.get(result_endpoint, headers=headers)
             response.raise_for_status()
             data = response.json().get("data", {})
@@ -135,8 +141,10 @@ class KlingAITool:
                 videos = data.get("task_result", {}).get("videos", [])
                 if not videos or not videos[0].get("url"):
                     raise Exception("Kling task completed without a video URL")
+                self._heartbeat(on_heartbeat)
                 video_response = requests.get(videos[0]["url"])
                 video_response.raise_for_status()
+                self._heartbeat(on_heartbeat)
                 with open(save_at, "wb") as file:
                     file.write(video_response.content)
                 return None
