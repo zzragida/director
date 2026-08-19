@@ -25,6 +25,10 @@ class FakeDB:
     def __init__(self):
         self.context = {}
         self.write_count = 0
+        self.now = 1000
+
+    def current_epoch(self):
+        return self.now
 
     def get_context_messages(self, session_id):
         return copy.deepcopy(self.context.get(session_id, {}))
@@ -47,6 +51,7 @@ class FakeSession:
         self.db = db
         self.session_id = session_id
         self.agent_context = {}
+        self.state = {}
 
 
 def load_checkpoint_module(monkeypatch):
@@ -232,6 +237,59 @@ def test_stale_checkpoint_revision_cannot_overwrite_newer_progress(monkeypatch):
     assert persisted.revision == 2
     assert persisted.status == "generating"
     assert persisted.scenes[0].media["id"] == "scene-1"
+
+
+def test_stale_fencing_token_rejects_write_even_when_revision_matches(monkeypatch):
+    checkpoint = load_checkpoint_module(monkeypatch)
+    from director.core.generation_lease import GenerationLeaseStore
+
+    db = FakeDB()
+    old_session = FakeSession(db)
+    old_lease_store = GenerationLeaseStore(old_session)
+    old_lease = old_lease_store.acquire(
+        "genop:scene_video:0:fence-test",
+        owner_id="worker-old",
+        ttl_seconds=30,
+    ).lease
+
+    fingerprint = checkpoint.build_request_fingerprint(
+        collection_id="collection-1",
+        engine="videodb",
+        audio_engine="videodb",
+        storyline="A quiet reunion",
+    )
+    value = checkpoint.create_checkpoint(
+        request_fingerprint=fingerprint,
+        visual_style={"camera_setup": "35mm"},
+        scenes=sample_scenes(),
+    )
+    old_store = checkpoint.TextToMovieCheckpointStore(old_session)
+    old_store.save(value)
+    assert value.revision == 1
+
+    db.now = 1031
+    new_session = FakeSession(db)
+    new_lease_store = GenerationLeaseStore(new_session)
+    takeover = new_lease_store.acquire(
+        old_lease.operation_id,
+        owner_id="worker-new",
+        ttl_seconds=30,
+    )
+    assert takeover.acquired is True
+    assert takeover.lease.fencing_token == old_lease.fencing_token + 1
+
+    stale = old_store.get(value.checkpoint_id)
+    stale.status = "failed"
+    with pytest.raises(checkpoint.CheckpointFenceError) as exc_info:
+        old_store.save(stale)
+    assert exc_info.value.reason_code == "stale_fencing_token"
+
+    winner_store = checkpoint.TextToMovieCheckpointStore(new_session)
+    winner = winner_store.get(value.checkpoint_id)
+    winner.status = "generating"
+    winner_store.save(winner)
+    assert winner.revision == 2
+    assert winner_store.get(value.checkpoint_id).status == "generating"
 
 
 def test_compact_media_requires_stable_id(monkeypatch):
