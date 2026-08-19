@@ -4,9 +4,19 @@ import types
 from pathlib import Path
 
 
+class FakeCollection:
+    id = "collection-1"
+
+    def get_video(self, video_id):
+        return None
+
+
 class FakeSession:
     def __init__(self):
         self.output_message = object()
+        self.collection_id = "collection-1"
+        self.video_id = None
+        self.state = {"collection": FakeCollection()}
 
 
 def load_base_agent_module(monkeypatch):
@@ -72,6 +82,19 @@ def test_invalid_keyword_arguments_return_typed_error_without_execution(monkeypa
     assert response.data["details"][0]["field"] == "duration"
     assert agent.executions == 0
     assert "5" not in str(response.data["details"])
+
+
+def test_semantically_wrong_collection_returns_typed_error_without_execution(monkeypatch):
+    base_module = load_base_agent_module(monkeypatch)
+    agent = make_agent(base_module)
+
+    response = agent.safe_call(collection_id="other-collection", duration=5)
+
+    assert response.status == base_module.AgentStatus.ERROR
+    assert response.data["error"] == "invalid_tool_semantics"
+    assert response.data["details"][0]["code"] == "collection_context_mismatch"
+    assert agent.executions == 0
+    assert "other-collection" not in str(response.data["details"])
 
 
 def test_valid_keyword_arguments_execute_agent(monkeypatch):
