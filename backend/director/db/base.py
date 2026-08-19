@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 class BaseDB(ABC):
@@ -42,6 +42,23 @@ class BaseDB(ABC):
         self, session_id: str, context_messages: list
     ) -> None:
         """Update context messages for a session."""
+        pass
+
+    @abstractmethod
+    def compare_and_swap_context_msg(
+        self,
+        session_id: str,
+        expected_context: Optional[dict],
+        context_messages: dict,
+    ) -> bool:
+        """Atomically replace a session context document when it still matches.
+
+        ``expected_context`` is the document previously read by the caller. When
+        it is ``None``, the method succeeds only if no context row exists yet.
+        Return ``True`` only when this caller created/replaced the row. A
+        concurrent writer must cause ``False`` rather than silently overwriting
+        its update. Database errors should propagate.
+        """
         pass
 
     @abstractmethod
