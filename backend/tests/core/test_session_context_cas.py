@@ -4,8 +4,10 @@ import sys
 import types
 from pathlib import Path
 
+from director.db.base import BaseDB
 
-class FakeDB:
+
+class FakeDB(BaseDB):
     def __init__(self):
         self.context = {
             "session-1": {
@@ -24,6 +26,9 @@ class FakeDB:
 
     def get_context_messages(self, session_id):
         return copy.deepcopy(self.context.get(session_id, {}))
+
+    def add_or_update_context_msg(self, session_id, context_messages, **kwargs):
+        self.context[session_id] = copy.deepcopy(context_messages)
 
     def compare_and_swap_context_msg(self, session_id, expected_context, context_messages):
         if self.fail_next_cas:
@@ -52,11 +57,14 @@ class FakeDB:
     def get_sessions(self):
         return []
 
-    def create_session(self, **kwargs):
+    def create_session(self, *args, **kwargs):
         pass
 
     def delete_session(self, session_id):
         return True, []
+
+    def health_check(self):
+        return True
 
 
 def load_session_module(monkeypatch):
@@ -100,7 +108,6 @@ def test_session_save_preserves_reserved_durable_context(monkeypatch):
             content="agent context",
         )
     ]
-    # A stale reserved entry in local agent context must not override DB state.
     session.agent_context["__generation_operation_leases__"] = [
         session_module.ContextMessage(
             role=session_module.RoleTypes.system,
