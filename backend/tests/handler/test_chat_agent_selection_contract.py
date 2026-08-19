@@ -168,7 +168,7 @@ def test_unknown_client_agent_stops_before_reasoning(monkeypatch):
 
     handler = handler_module.ChatHandler(db=object())
     handler.agents = [KnownAgent]
-    handler.add_videodb_state = lambda session: None
+    handler.add_videodb_state = lambda session, media_state=None: None
 
     handler.chat(
         {
@@ -192,7 +192,7 @@ def test_known_client_agent_reaches_reasoning(monkeypatch):
 
     handler = handler_module.ChatHandler(db=object())
     handler.agents = [KnownAgent]
-    handler.add_videodb_state = lambda session: None
+    handler.add_videodb_state = lambda session, media_state=None: None
 
     handler.chat(
         {
