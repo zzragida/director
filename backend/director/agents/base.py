@@ -18,6 +18,8 @@ from director.core.tool_semantics import (
 
 logger = logging.getLogger(__name__)
 
+ACTIVE_AGENT_CALL_STATE_KEY = "__active_agent_call__"
+
 
 class AgentStatus:
     SUCCESS = "success"
@@ -82,13 +84,36 @@ class BaseAgent(ABC):
         return self.description
 
     def safe_call(self, *args, **kwargs):
+        active_state = None
+        had_previous_call = False
+        previous_call = None
         try:
             # LLM tool calls are keyword-based. Preserve compatibility with any
             # existing internal positional calls while validating the tool path.
             if not args:
                 validate_tool_arguments(self.effective_parameters(), kwargs)
                 validate_tool_semantics(self.session, self.agent_name, kwargs)
-            return self.run(*args, **kwargs)
+
+                active_state = getattr(self.session, "state", None)
+                if isinstance(active_state, dict):
+                    had_previous_call = ACTIVE_AGENT_CALL_STATE_KEY in active_state
+                    previous_call = active_state.get(ACTIVE_AGENT_CALL_STATE_KEY)
+                    # Ephemeral execution context only. Session context persistence
+                    # does not serialize session.state, and this value is removed in
+                    # the finally block below.
+                    active_state[ACTIVE_AGENT_CALL_STATE_KEY] = {
+                        "agent_name": self.agent_name,
+                        "arguments": dict(kwargs),
+                    }
+
+            try:
+                return self.run(*args, **kwargs)
+            finally:
+                if isinstance(active_state, dict):
+                    if had_previous_call:
+                        active_state[ACTIVE_AGENT_CALL_STATE_KEY] = previous_call
+                    else:
+                        active_state.pop(ACTIVE_AGENT_CALL_STATE_KEY, None)
 
         except ToolArgumentValidationError as error:
             logger.warning("Invalid arguments for %s agent", self.agent_name)
