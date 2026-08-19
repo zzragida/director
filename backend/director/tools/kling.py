@@ -17,9 +17,7 @@ PARAMS_CONFIG = {
         },
         "cfg_scale": {
             "type": "number",
-            "description": "Flexibility in video generation. The higher the value, "
-            "the lower the model's degree of flexibility and the "
-            "stronger the relevance to the user's prompt",
+            "description": "Flexibility in video generation. The higher the value, the lower the model's degree of flexibility and the stronger the relevance to the user's prompt",
             "minimum": 0,
             "maximum": 1,
             "default": 0.5,
@@ -35,15 +33,7 @@ PARAMS_CONFIG = {
             "properties": {
                 "type": {
                     "type": "string",
-                    "description": "Type of camera movement. Options are:\n"
-                    "- simple: Basic camera movement, configurable via config\n"
-                    "- none: No camera movement\n"
-                    "- down_back: Camera descends and moves backward with pan down and\n"
-                    "  zoom out effect\n"
-                    "- forward_up: Camera moves forward and tilts up with zoom in\n"
-                    "  and pan up effect\n"
-                    "- right_turn_forward: Camera rotates right while moving forward\n"
-                    "- left_turn_forward: Camera rotates left while moving forward",
+                    "description": "Type of camera movement",
                     "enum": [
                         "simple",
                         "none",
@@ -56,50 +46,13 @@ PARAMS_CONFIG = {
                 },
                 "config": {
                     "type": "object",
-                    "description": "Contains 8 fields to specify the camera's movement or change in different directions, This should only be passed if type is simple",
                     "properties": {
-                        "horizontal": {
-                            "type": "number",
-                            "description": "Controls the camera's movement along the horizontal axis (translation along the x-axis). Value range: [-10, 10], negative value indicates translation to the left, positive value indicates translation to the right",
-                            "minimum": -10,
-                            "maximum": 10,
-                            "default": 0,
-                        },
-                        "vertical": {
-                            "type": "number",
-                            "description": "Controls the camera's movement along the vertical axis (translation along the y-axis). Value range: [-10, 10], negative value indicates a downward translation, positive value indicates an upward translation",
-                            "minimum": -10,
-                            "maximum": 10,
-                            "default": 0,
-                        },
-                        "pan": {
-                            "type": "number",
-                            "description": "Controls the camera's rotation in the horizontal plane (rotation around the y-axis). Value range: [-10, 10], negative value indicates rotation to the left, positive value indicates rotation to the right",
-                            "minimum": -10,
-                            "maximum": 10,
-                            "default": 0,
-                        },
-                        "tilt": {
-                            "type": "number",
-                            "description": "Controls the camera's rotation in the vertical plane (rotation around the x-axis). Value range: [-10, 10], negative value indicates downward rotation, positive value indicates upward rotation",
-                            "minimum": -10,
-                            "maximum": 10,
-                            "default": 0,
-                        },
-                        "roll": {
-                            "type": "number",
-                            "description": "Controls the camera's rolling amount (rotation around the z-axis). Value range: [-10, 10], negative value indicates counterclockwise rotation, positive value indicates clockwise rotation",
-                            "minimum": -10,
-                            "maximum": 10,
-                            "default": 0,
-                        },
-                        "zoom": {
-                            "type": "number",
-                            "description": "Controls the change in the camera's focal length, affecting the proximity of the field of view. Value range: [-10, 10], negative value indicates increase in focal length (narrower field of view), positive value indicates decrease in focal length (wider field of view)",
-                            "minimum": -10,
-                            "maximum": 10,
-                            "default": 0,
-                        },
+                        "horizontal": {"type": "number", "minimum": -10, "maximum": 10, "default": 0},
+                        "vertical": {"type": "number", "minimum": -10, "maximum": 10, "default": 0},
+                        "pan": {"type": "number", "minimum": -10, "maximum": 10, "default": 0},
+                        "tilt": {"type": "number", "minimum": -10, "maximum": 10, "default": 0},
+                        "roll": {"type": "number", "minimum": -10, "maximum": 10, "default": 0},
+                        "zoom": {"type": "number", "minimum": -10, "maximum": 10, "default": 0},
                     },
                 },
             },
@@ -114,74 +67,78 @@ class KlingAITool:
         self.video_endpoint = f"{self.api_route}/v1/videos/text2video"
         self.access_key = access_key
         self.secret_key = secret_key
-        self.polling_interval = 30  # seconds
+        self.polling_interval = 30
 
     def get_authorization_token(self):
         headers = {"alg": "HS256", "typ": "JWT"}
         payload = {
             "iss": self.access_key,
-            "exp": int(time.time()) + 1800,  # Valid for 30 minutes
-            "nbf": int(time.time()) - 5,  # Start 5 seconds ago
+            "exp": int(time.time()) + 1800,
+            "nbf": int(time.time()) - 5,
         }
-        token = jwt.encode(payload, self.secret_key, headers=headers)
-        return token
+        return jwt.encode(payload, self.secret_key, headers=headers)
 
     def text_to_video(
-        self, prompt: str, save_at: str, duration: float, config: dict
+        self,
+        prompt: str,
+        save_at: str,
+        duration: float,
+        config: dict,
+        on_request_id=None,
     ):
+        """Submit a Kling task and download it when complete.
+
+        ``on_request_id`` is invoked immediately after Kling returns ``task_id``.
+        Persisting that ID lets the caller resume polling after a later failure
+        without submitting a second generation request.
         """
-        Generate a video from a text prompt using KlingAI's API.
-        :param str prompt: The text prompt to generate the video
-        :param str save_at: File path to save the generated video
-        :param float duration: Duration of the video in seconds
-        :param dict config: Additional configuration options
-        """
+
         api_key = self.get_authorization_token()
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-
         payload = {
             "prompt": prompt,
             "model": config.get("model", "kling-v1"),
             "duration": duration,
-            **config,  # Include any additional configuration parameters
+            **config,
         }
 
         response = requests.post(self.video_endpoint, headers=headers, json=payload)
-
         if response.status_code != 200:
-            raise Exception(f"Error generating video: {response.text}")
+            raise Exception("Kling video submission failed")
 
-        # Assuming the API returns a job ID for asynchronous processing
-        job_id = response.json()["data"].get("task_id")
+        job_id = response.json().get("data", {}).get("task_id")
         if not job_id:
-            raise Exception("No task ID returned from the API.")
+            raise Exception("Kling did not return a task ID")
 
-        # Polling for the video generation completion
-        result_endpoint = f"{self.api_route}/v1/videos/text2video/{job_id}"
+        if on_request_id is not None:
+            on_request_id(str(job_id))
+
+        return self.resume_text_to_video(str(job_id), save_at)
+
+    def resume_text_to_video(self, request_id: str, save_at: str):
+        """Resume polling/downloading an already submitted Kling task."""
+
+        api_key = self.get_authorization_token()
+        result_endpoint = f"{self.api_route}/v1/videos/text2video/{request_id}"
+        headers = {"Authorization": f"Bearer {api_key}"}
 
         while True:
-            response = requests.get(
-                result_endpoint, headers={"Authorization": f"Bearer {api_key}"}
-            )
+            response = requests.get(result_endpoint, headers=headers)
             response.raise_for_status()
-
-            print("Kling Response", response)
-
-            status = response.json()["data"]["task_status"]
+            data = response.json().get("data", {})
+            status = data.get("task_status")
 
             if status == "succeed":
-                # Video generation is complete
-                video_url = response.json()["data"]["task_result"]["videos"][0]["url"]
-                # Download and save the video
-                video_response = requests.get(video_url)
+                videos = data.get("task_result", {}).get("videos", [])
+                if not videos or not videos[0].get("url"):
+                    raise Exception("Kling task completed without a video URL")
+                video_response = requests.get(videos[0]["url"])
                 video_response.raise_for_status()
-                with open(save_at, "wb") as f:
-                    f.write(video_response.content)
-                break
-            else:
-                # Still processing
-                time.sleep(self.polling_interval)
-                continue
+                with open(save_at, "wb") as file:
+                    file.write(video_response.content)
+                return None
+
+            time.sleep(self.polling_interval)

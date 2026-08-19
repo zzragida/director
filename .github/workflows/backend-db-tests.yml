@@ -11,6 +11,9 @@ on:
       - "backend/director/core/tool_semantics.py"
       - "backend/director/core/text_to_movie_contract.py"
       - "backend/director/core/text_to_movie_checkpoint.py"
+      - "backend/director/core/generation_lifecycle.py"
+      - "backend/director/tools/kling.py"
+      - "backend/director/tools/stabilityai.py"
       - "backend/director/agents/base.py"
       - "backend/director/agents/summarize_video.py"
       - "backend/director/agents/upload.py"
@@ -35,6 +38,9 @@ on:
       - "backend/director/core/tool_semantics.py"
       - "backend/director/core/text_to_movie_contract.py"
       - "backend/director/core/text_to_movie_checkpoint.py"
+      - "backend/director/core/generation_lifecycle.py"
+      - "backend/director/tools/kling.py"
+      - "backend/director/tools/stabilityai.py"
       - "backend/director/agents/base.py"
       - "backend/director/agents/summarize_video.py"
       - "backend/director/agents/upload.py"
@@ -72,6 +78,15 @@ jobs:
           python-dotenv==1.0.1
           pydantic==2.8.2
 
+      - name: Compile generation paths
+        run: >-
+          python -m py_compile
+          backend/director/core/generation_lifecycle.py
+          backend/director/core/text_to_movie_checkpoint.py
+          backend/director/tools/kling.py
+          backend/director/tools/stabilityai.py
+          backend/director/agents/text_to_movie.py
+
       - name: Run backend contract tests
         env:
           PYTHONPATH: backend
@@ -85,9 +100,11 @@ jobs:
           backend/tests/core/test_tool_semantics.py
           backend/tests/core/test_text_to_movie_contract.py
           backend/tests/core/test_text_to_movie_checkpoint.py
+          backend/tests/core/test_generation_lifecycle.py
           backend/tests/agents/test_base_agent_tool_contract.py
           backend/tests/agents/test_agent_failure_contract.py
           backend/tests/agents/test_text_to_movie_structured_contract.py
           backend/tests/agents/test_text_to_movie_checkpoint_resume.py
+          backend/tests/agents/test_text_to_movie_provider_reconciliation.py
           backend/tests/handler/test_chat_agent_selection_contract.py
           backend/tests/entrypoint/test_chat_socket_contract.py

@@ -1,7 +1,9 @@
-import requests
-import time
-from PIL import Image
 import io
+import os
+import time
+
+import requests
+from PIL import Image
 
 PARAMS_CONFIG = {
     "text_to_video": {
@@ -45,91 +47,95 @@ class StabilityAITool:
         )
         self.video_endpoint = "https://api.stability.ai/v2beta/image-to-video"
         self.result_endpoint = "https://api.stability.ai/v2beta/image-to-video/result"
-        self.polling_interval = 10  # seconds
+        self.polling_interval = 10
 
-    def text_to_video(self, prompt: str, save_at: str, duration: float, config: dict):
-        """
-        Generate a video from a text prompt using Stability AI's API.
-        First generates an image from text, then converts it to video.
-        :param str prompt: The text prompt to generate the video
-        :param str save_at: File path to save the generated video
-        :param float duration: Duration of the video in seconds
-        :param dict config: Additional configuration options
-        """
-        # First generate image from text
-        headers = {"authorization": f"Bearer {self.api_key}", "accept": "image/*"}
+    def text_to_video(
+        self,
+        prompt: str,
+        save_at: str,
+        duration: float,
+        config: dict,
+        on_request_id=None,
+    ):
+        """Submit Stability image-to-video work and download it when complete.
 
+        The provider generation ID is surfaced through ``on_request_id`` as
+        soon as it is known so the caller can durably checkpoint it before the
+        potentially long polling/download phase.
+        """
+
+        headers = {
+            "authorization": f"Bearer {self.api_key}",
+            "accept": "image/*",
+        }
         image_payload = {
             "prompt": prompt,
             "output_format": config.get("format", "png"),
             "aspect_ratio": config.get("aspect_ratio", "16:9"),
             "negative_prompt": config.get("negative_prompt", ""),
         }
-
         image_response = requests.post(
-            self.image_endpoint, headers=headers, files={"none": ""}, data=image_payload
+            self.image_endpoint,
+            headers=headers,
+            files={"none": ""},
+            data=image_payload,
         )
-
         if image_response.status_code != 200:
-            raise Exception(f"Error generating image: {image_response.text}")
+            raise Exception("Stability image generation failed")
 
         image = Image.open(io.BytesIO(image_response.content))
-
-        # Set the new dimensions
         new_width = 1024
-        new_height = int(new_width * (576 / 1024))  # Maintain the 16:9 aspect ratio
-
-        # Resize the image
+        new_height = int(new_width * (576 / 1024))
         scaled_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
         temp_image_path = f"{save_at}.temp.png"
-
-        # Save temporary image
         scaled_image.save(temp_image_path)
 
-        # Generate video from the image
-        video_headers = {"authorization": f"Bearer {self.api_key}"}
+        try:
+            video_headers = {"authorization": f"Bearer {self.api_key}"}
+            video_payload = {
+                "seed": config.get("seed", 0),
+                "cfg_scale": config.get("cfg_scale", 1.8),
+                "motion_bucket_id": config.get("motion_bucket_id", 127),
+            }
+            with open(temp_image_path, "rb") as img_file:
+                video_response = requests.post(
+                    self.video_endpoint,
+                    headers=video_headers,
+                    files={"image": img_file},
+                    data=video_payload,
+                )
+            if video_response.status_code != 200:
+                raise Exception("Stability video submission failed")
 
-        video_payload = {
-            "seed": config.get("seed", 0),
-            "cfg_scale": config.get("cfg_scale", 1.8),
-            "motion_bucket_id": config.get("motion_bucket_id", 127),
-        }
+            generation_id = video_response.json().get("id")
+            if not generation_id:
+                raise Exception("Stability did not return a generation ID")
 
-        with open(temp_image_path, "rb") as img_file:
-            video_response = requests.post(
-                self.video_endpoint,
-                headers=video_headers,
-                files={"image": img_file},
-                data=video_payload,
-            )
+            if on_request_id is not None:
+                on_request_id(str(generation_id))
 
-        if video_response.status_code != 200:
-            raise Exception(f"Error generating video: {video_response.text}")
+            return self.resume_text_to_video(str(generation_id), save_at)
+        finally:
+            if os.path.exists(temp_image_path):
+                os.remove(temp_image_path)
 
-        # Get generation ID and wait for completion
-        generation_id = video_response.json().get("id")
-        if not generation_id:
-            raise Exception("No generation ID in response")
+    def resume_text_to_video(self, request_id: str, save_at: str):
+        """Resume polling/downloading an already submitted Stability job."""
 
-        # Poll for completion
-        result_headers = {
+        headers = {
             "accept": "video/*",
             "authorization": f"Bearer {self.api_key}",
         }
-
         while True:
             result_response = requests.get(
-                f"{self.result_endpoint}/{generation_id}", headers=result_headers
+                f"{self.result_endpoint}/{request_id}",
+                headers=headers,
             )
-
             if result_response.status_code == 202:
-                # Still processing
                 time.sleep(self.polling_interval)
                 continue
-            elif result_response.status_code == 200:
-                with open(save_at, "wb") as f:
-                    f.write(result_response.content)
-                break
-            else:
-                raise Exception(f"Error fetching video: {result_response.text}")
+            if result_response.status_code == 200:
+                with open(save_at, "wb") as file:
+                    file.write(result_response.content)
+                return None
+            raise Exception("Stability video result retrieval failed")
