@@ -30,14 +30,9 @@ class PostgresDB(BaseDB):
         self.cursor = self.conn.cursor(cursor_factory=RealDictCursor)
 
     def create_session(
-        self,
-        session_id: str,
-        video_id: str,
-        collection_id: str,
-        created_at: int = None,
-        updated_at: int = None,
-        metadata: dict = {},
-        **kwargs,
+        self, session_id: str, video_id: str, collection_id: str,
+        created_at: int = None, updated_at: int = None,
+        metadata: dict = {}, **kwargs,
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
@@ -47,45 +42,23 @@ class PostgresDB(BaseDB):
             VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (session_id) DO NOTHING
             """,
-            (
-                session_id,
-                video_id,
-                collection_id,
-                created_at,
-                updated_at,
-                json.dumps(metadata),
-            ),
+            (session_id, video_id, collection_id, created_at, updated_at, json.dumps(metadata)),
         )
         self.conn.commit()
 
     def get_session(self, session_id: str) -> dict:
-        self.cursor.execute(
-            "SELECT * FROM sessions WHERE session_id = %s", (session_id,)
-        )
+        self.cursor.execute("SELECT * FROM sessions WHERE session_id = %s", (session_id,))
         row = self.cursor.fetchone()
-        if row is not None:
-            return dict(row)
-        return {}
+        return dict(row) if row is not None else {}
 
     def get_sessions(self) -> list:
         self.cursor.execute("SELECT * FROM sessions ORDER BY updated_at DESC")
-        rows = self.cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in self.cursor.fetchall()]
 
     def add_or_update_msg_to_conv(
-        self,
-        session_id: str,
-        conv_id: str,
-        msg_id: str,
-        msg_type: str,
-        agents: List[str],
-        actions: List[str],
-        content: List[dict],
-        status: str = None,
-        created_at: int = None,
-        updated_at: int = None,
-        metadata: dict = {},
-        **kwargs,
+        self, session_id: str, conv_id: str, msg_id: str, msg_type: str,
+        agents: List[str], actions: List[str], content: List[dict], status: str = None,
+        created_at: int = None, updated_at: int = None, metadata: dict = {}, **kwargs,
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
@@ -94,8 +67,7 @@ class PostgresDB(BaseDB):
             INSERT INTO conversations (
                 session_id, conv_id, msg_id, msg_type, agents, actions,
                 content, status, created_at, updated_at, metadata
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (msg_id) DO UPDATE SET
                 session_id = EXCLUDED.session_id,
                 conv_id = EXCLUDED.conv_id,
@@ -108,17 +80,9 @@ class PostgresDB(BaseDB):
                 metadata = EXCLUDED.metadata
             """,
             (
-                session_id,
-                conv_id,
-                msg_id,
-                msg_type,
-                json.dumps(agents),
-                json.dumps(actions),
-                json.dumps(content),
-                status,
-                created_at,
-                updated_at,
-                json.dumps(metadata),
+                session_id, conv_id, msg_id, msg_type, json.dumps(agents),
+                json.dumps(actions), json.dumps(content), status, created_at,
+                updated_at, json.dumps(metadata),
             ),
         )
         self.conn.commit()
@@ -128,8 +92,7 @@ class PostgresDB(BaseDB):
             "SELECT * FROM conversations WHERE session_id = %s ORDER BY created_at ASC",
             (session_id,),
         )
-        rows = self.cursor.fetchall()
-        return [dict(row) for row in rows if row is not None]
+        return [dict(row) for row in self.cursor.fetchall() if row is not None]
 
     def get_context_messages(self, session_id: str) -> list:
         self.cursor.execute(
@@ -140,13 +103,9 @@ class PostgresDB(BaseDB):
         return result["context_data"] if result else {}
 
     def add_or_update_context_msg(
-        self,
-        session_id: str,
-        context_messages: list,
-        created_at: int = None,
-        updated_at: int = None,
-        metadata: dict = {},
-        **kwargs,
+        self, session_id: str, context_messages: list,
+        created_at: int = None, updated_at: int = None,
+        metadata: dict = {}, **kwargs,
     ) -> None:
         created_at = created_at or int(time.time())
         updated_at = updated_at or int(time.time())
@@ -159,13 +118,7 @@ class PostgresDB(BaseDB):
                 updated_at = EXCLUDED.updated_at,
                 metadata = EXCLUDED.metadata
             """,
-            (
-                json.dumps(context_messages),
-                session_id,
-                created_at,
-                updated_at,
-                json.dumps(metadata),
-            ),
+            (json.dumps(context_messages), session_id, created_at, updated_at, json.dumps(metadata)),
         )
         self.conn.commit()
 
@@ -175,22 +128,11 @@ class PostgresDB(BaseDB):
         expected_context: Optional[dict],
         context_messages: dict,
     ) -> bool:
-        """Atomically update the JSONB context without overwriting a peer writer."""
-
+        """Atomically replace JSONB context only when the observed document is unchanged."""
         now = int(time.time())
         new_context = json.dumps(context_messages)
 
-        if expected_context is None:
-            self.cursor.execute(
-                """
-                INSERT INTO context_messages
-                    (context_data, session_id, created_at, updated_at, metadata)
-                VALUES (%s::jsonb, %s, %s, %s, %s::jsonb)
-                ON CONFLICT (session_id) DO NOTHING
-                """,
-                (new_context, session_id, now, now, json.dumps({})),
-            )
-        else:
+        if expected_context is not None:
             expected = json.dumps(expected_context)
             self.cursor.execute(
                 """
@@ -200,22 +142,33 @@ class PostgresDB(BaseDB):
                 """,
                 (new_context, now, session_id, expected),
             )
+            if self.cursor.rowcount > 0:
+                self.conn.commit()
+                return True
+            if expected_context != {}:
+                self.conn.commit()
+                return False
 
+        self.cursor.execute(
+            """
+            INSERT INTO context_messages
+                (context_data, session_id, created_at, updated_at, metadata)
+            VALUES (%s::jsonb, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (session_id) DO NOTHING
+            """,
+            (new_context, session_id, now, now, json.dumps({})),
+        )
         changed = self.cursor.rowcount > 0
         self.conn.commit()
         return changed
 
     def delete_conversation(self, session_id: str) -> bool:
-        self.cursor.execute(
-            "DELETE FROM conversations WHERE session_id = %s", (session_id,)
-        )
+        self.cursor.execute("DELETE FROM conversations WHERE session_id = %s", (session_id,))
         self.conn.commit()
         return self.cursor.rowcount > 0
 
     def delete_context(self, session_id: str) -> bool:
-        self.cursor.execute(
-            "DELETE FROM context_messages WHERE session_id = %s", (session_id,)
-        )
+        self.cursor.execute("DELETE FROM context_messages WHERE session_id = %s", (session_id,))
         self.conn.commit()
         return self.cursor.rowcount > 0
 
@@ -225,20 +178,19 @@ class PostgresDB(BaseDB):
         self.cursor.execute("DELETE FROM sessions WHERE session_id = %s", (session_id,))
         self.conn.commit()
         session_deleted = self.cursor.rowcount > 0
-        failed_components = [] if session_deleted else ["session"]
-        return session_deleted, failed_components
+        return session_deleted, [] if session_deleted else ["session"]
 
     def health_check(self) -> bool:
         try:
-            query = """
+            self.cursor.execute(
+                """
                 SELECT COUNT(table_name)
                 FROM information_schema.tables
                 WHERE table_name IN ('sessions', 'conversations', 'context_messages')
                 AND table_schema = 'public';
-            """
-            self.cursor.execute(query)
-            table_count = self.cursor.fetchone()["count"]
-            if table_count < 3:
+                """
+            )
+            if self.cursor.fetchone()["count"] < 3:
                 logger.info("Tables not found. Initializing PostgreSQL DB...")
                 initialize_postgres()
             return True
