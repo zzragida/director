@@ -59,10 +59,14 @@ def make_agent(base_module, name="contract_agent", parameters=None):
             self.description = "contract test agent"
             self.parameters = parameters
             self.executions = 0
+            self.observed_active_call = None
             super().__init__(session=FakeSession())
 
         def run(self, *args, **kwargs):
             self.executions += 1
+            self.observed_active_call = self.session.state.get(
+                base_module.ACTIVE_AGENT_CALL_STATE_KEY
+            )
             return base_module.AgentResponse(
                 status=base_module.AgentStatus.SUCCESS,
                 message="executed",
@@ -107,6 +111,20 @@ def test_valid_keyword_arguments_execute_agent(monkeypatch):
     assert agent.executions == 1
 
 
+def test_validated_keyword_call_context_exists_only_during_execution(monkeypatch):
+    base_module = load_base_agent_module(monkeypatch)
+    agent = make_agent(base_module)
+
+    response = agent.safe_call(collection_id="collection-1", duration=5)
+
+    assert response.status == base_module.AgentStatus.SUCCESS
+    assert agent.observed_active_call == {
+        "agent_name": "contract_agent",
+        "arguments": {"collection_id": "collection-1", "duration": 5},
+    }
+    assert base_module.ACTIVE_AGENT_CALL_STATE_KEY not in agent.session.state
+
+
 def test_positional_internal_calls_keep_existing_compatibility(monkeypatch):
     base_module = load_base_agent_module(monkeypatch)
     agent = make_agent(base_module)
@@ -115,6 +133,7 @@ def test_positional_internal_calls_keep_existing_compatibility(monkeypatch):
 
     assert response.status == base_module.AgentStatus.SUCCESS
     assert agent.executions == 1
+    assert agent.observed_active_call is None
 
 
 def test_text_to_movie_advertises_runtime_required_payload(monkeypatch):
