@@ -36,6 +36,7 @@ class SummarizeVideoAgent(BaseAgent):
         :rtype: AgentResponse
 
         """
+        output_text_content = None
         try:
             self.output_message.actions.append("Started summary generation..")
             output_text_content = TextContent(
@@ -59,8 +60,8 @@ class SummarizeVideoAgent(BaseAgent):
             llm_response = self.llm.chat_completions([summary_llm_message.to_llm_msg()])
             if not llm_response.status:
                 logger.error(f"LLM failed with {llm_response}")
-                output_text_content.status = MsgStatus.failed
-                output_text_content.status_message = "Failed to generat the summary."
+                output_text_content.status = MsgStatus.error
+                output_text_content.status_message = "Failed to generate the summary."
                 self.output_message.publish()
                 return AgentResponse(
                     status=AgentStatus.ERROR,
@@ -73,9 +74,10 @@ class SummarizeVideoAgent(BaseAgent):
             self.output_message.publish()
         except Exception as e:
             logger.exception(f"Error in {self.agent_name} agent.")
-            output_text_content.status = MsgStatus.error
-            output_text_content.status_message = "Error in generating summary."
-            self.output_message.publish()
+            if output_text_content is not None:
+                output_text_content.status = MsgStatus.error
+                output_text_content.status_message = "Error in generating summary."
+                self.output_message.publish()
             return AgentResponse(status=AgentStatus.ERROR, message=str(e))
 
         return AgentResponse(

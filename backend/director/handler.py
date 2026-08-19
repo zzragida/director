@@ -44,7 +44,6 @@ class ChatHandler:
     def __init__(self, db, **kwargs):
         self.db = db
 
-        # Register the agents here
         self.agents = [
             SummarizeVideoAgent,
             UploadAgent,
@@ -97,6 +96,23 @@ class ChatHandler:
             for agent_instance in [agent(Session(db=self.db))]
         ]
 
+    @staticmethod
+    def select_requested_agents(agents, requested_agent_names):
+        """Resolve explicit client agent selections without raising KeyError."""
+        if not requested_agent_names:
+            return agents, []
+
+        agents_mapping = {agent.name: agent for agent in agents}
+        unknown_agents = [
+            name for name in requested_agent_names if name not in agents_mapping
+        ]
+        selected_agents = [
+            agents_mapping[name]
+            for name in requested_agent_names
+            if name in agents_mapping
+        ]
+        return selected_agents, unknown_agents
+
     def chat(self, message):
         logger.info(f"ChatHandler input message: {message}")
 
@@ -108,15 +124,21 @@ class ChatHandler:
         try:
             self.add_videodb_state(session)
             agents = [agent(session=session) for agent in self.agents]
-            agents_mapping = {agent.name: agent for agent in agents}
+            selected_agents, unknown_agents = self.select_requested_agents(
+                agents, input_message.agents
+            )
+
+            if unknown_agents:
+                error_message = (
+                    "Unknown agent requested: " + ", ".join(unknown_agents)
+                )
+                session.output_message.actions.append(error_message)
+                session.output_message.update_status(MsgStatus.error)
+                logger.warning(error_message)
+                return
 
             res_eng = ReasoningEngine(input_message=input_message, session=session)
-            if input_message.agents:
-                for agent_name in input_message.agents:
-                    res_eng.register_agents([agents_mapping[agent_name]])
-            else:
-                res_eng.register_agents(agents)
-
+            res_eng.register_agents(selected_agents)
             res_eng.run()
 
         except Exception as e:
