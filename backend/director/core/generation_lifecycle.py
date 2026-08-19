@@ -1,4 +1,5 @@
 import hashlib
+import time
 from enum import Enum
 from typing import Any, Dict, Optional
 
@@ -17,15 +18,15 @@ class GenerationOperationState(str, Enum):
 class GenerationOperation(BaseModel):
     """Durable lifecycle metadata for one external generation operation.
 
-    This model tracks Director's own operation identity separately from any
-    provider request ID. A provider request ID enables resume/reconciliation
-    when the provider exposes a fetch/poll API, but it is not treated as proof
-    of exactly-once submission.
+    Director's operation identity is intentionally separate from any provider
+    request ID. Provider request IDs enable resume/reconciliation when a
+    provider exposes a fetch/poll API, but they are not proof of exactly-once
+    submission.
     """
 
     model_config = ConfigDict(extra="forbid", use_enum_values=True)
 
-    version: int = 1
+    version: int = 2
     operation_id: str
     kind: str
     provider: str
@@ -35,6 +36,7 @@ class GenerationOperation(BaseModel):
     artifact: Optional[Dict[str, Any]] = None
     last_error_code: Optional[str] = None
     recoverable: bool = True
+    updated_at_epoch: Optional[int] = None
 
     @property
     def is_persisted(self) -> bool:
@@ -43,6 +45,14 @@ class GenerationOperation(BaseModel):
     @property
     def has_provider_resume_token(self) -> bool:
         return bool(self.provider_request_id) and not self.is_persisted
+
+
+def _now_epoch() -> int:
+    return int(time.time())
+
+
+def touch_operation(operation: GenerationOperation, *, now_epoch: Optional[int] = None) -> None:
+    operation.updated_at_epoch = int(now_epoch if now_epoch is not None else _now_epoch())
 
 
 def make_generation_run_id(request_fingerprint: str) -> str:
@@ -61,6 +71,13 @@ def make_operation_id(
     return f"genop:{kind}{suffix}:{digest}"
 
 
+def make_artifact_name(operation_id: str, media_type: str) -> str:
+    """Return a deterministic VideoDB name for recoverable persisted artifacts."""
+
+    digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:24]
+    return f"director-{media_type}-{digest}"
+
+
 def create_operation(
     generation_run_id: str,
     *,
@@ -68,7 +85,7 @@ def create_operation(
     provider: str,
     index: Optional[int] = None,
 ) -> GenerationOperation:
-    return GenerationOperation(
+    operation = GenerationOperation(
         operation_id=make_operation_id(
             generation_run_id,
             kind=kind,
@@ -77,6 +94,8 @@ def create_operation(
         kind=kind,
         provider=provider,
     )
+    touch_operation(operation)
+    return operation
 
 
 def begin_submission(operation: GenerationOperation) -> None:
@@ -84,6 +103,7 @@ def begin_submission(operation: GenerationOperation) -> None:
     operation.state = GenerationOperationState.submitting
     operation.last_error_code = None
     operation.recoverable = True
+    touch_operation(operation)
 
 
 def begin_resume(operation: GenerationOperation) -> None:
@@ -91,6 +111,7 @@ def begin_resume(operation: GenerationOperation) -> None:
     operation.state = GenerationOperationState.submitted
     operation.last_error_code = None
     operation.recoverable = True
+    touch_operation(operation)
 
 
 def record_provider_request(
@@ -101,10 +122,12 @@ def record_provider_request(
         return
     operation.provider_request_id = str(provider_request_id)
     operation.state = GenerationOperationState.submitted
+    touch_operation(operation)
 
 
 def record_materialized(operation: GenerationOperation) -> None:
     operation.state = GenerationOperationState.materialized
+    touch_operation(operation)
 
 
 def record_persisted(
@@ -115,6 +138,7 @@ def record_persisted(
     operation.state = GenerationOperationState.persisted
     operation.last_error_code = None
     operation.recoverable = False
+    touch_operation(operation)
 
 
 def record_failure(
@@ -126,6 +150,7 @@ def record_failure(
     operation.state = GenerationOperationState.failed
     operation.last_error_code = code
     operation.recoverable = recoverable
+    touch_operation(operation)
 
 
 def safe_operation_summary(operation: Optional[GenerationOperation]) -> Dict[str, Any]:
@@ -141,4 +166,5 @@ def safe_operation_summary(operation: Optional[GenerationOperation]) -> Dict[str
         "artifact_persisted": operation.is_persisted,
         "recoverable": operation.recoverable,
         "last_error_code": operation.last_error_code,
+        "updated_at_epoch": operation.updated_at_epoch,
     }

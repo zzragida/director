@@ -10,12 +10,19 @@ from videodb.asset import AudioAsset, VideoAsset
 from director.agents.base import AgentResponse, AgentStatus, BaseAgent
 from director.constants import DOWNLOADS_PATH
 from director.core.generation_lifecycle import (
+    GenerationOperationState,
     begin_resume,
     begin_submission,
+    make_artifact_name,
     record_failure,
     record_materialized,
     record_persisted,
     record_provider_request,
+)
+from director.core.generation_reconciliation import (
+    ReconciliationAction,
+    classify_generation_operation,
+    safe_reconciliation_summary,
 )
 from director.core.session import (
     ContextMessage,
@@ -320,7 +327,11 @@ class TextToMovieAgent(BaseAgent):
 
             if video_content is not None:
                 video_content.status = MsgStatus.error
-                video_content.status_message = "Movie generation paused and can be resumed"
+                video_content.status_message = (
+                    "Movie generation requires reconciliation"
+                    if error.stage == "reconciliation"
+                    else "Movie generation paused and can be resumed"
+                )
                 self.output_message.publish()
 
             data = {
@@ -340,10 +351,16 @@ class TextToMovieAgent(BaseAgent):
                 data["failed_scene_index"] = error.scene_index
             if error.operation_id is not None:
                 data["operation_id"] = error.operation_id
+            if error.reconciliation is not None:
+                data["reconciliation"] = error.reconciliation
 
             return AgentResponse(
                 status=AgentStatus.ERROR,
-                message="Movie generation paused after a recoverable pipeline failure.",
+                message=(
+                    "Movie generation is paused for reconciliation."
+                    if error.stage == "reconciliation"
+                    else "Movie generation paused after a recoverable pipeline failure."
+                ),
                 data=data,
             )
         except Exception:
@@ -472,6 +489,89 @@ class TextToMovieAgent(BaseAgent):
                 collection_id=collection_id
             )
 
+    def _find_durable_artifact(self, operation, media_type: str):
+        if operation.state not in (
+            GenerationOperationState.materialized,
+            GenerationOperationState.failed,
+        ):
+            return None
+        if (
+            operation.state == GenerationOperationState.failed
+            and operation.last_error_code not in {"scene_upload_failed", "audio_upload_failed"}
+        ):
+            return None
+
+        artifact_name = make_artifact_name(operation.operation_id, media_type)
+        try:
+            candidates = (
+                self.videodb_tool.get_videos()
+                if media_type == "video"
+                else self.videodb_tool.get_audios()
+            )
+        except Exception as exc:
+            raise TextToMovieExecutionError(
+                stage="reconciliation",
+                code="artifact_lookup_failed",
+                message="Unable to reconcile durable media state.",
+                resumable=False,
+                operation_id=operation.operation_id,
+            ) from exc
+
+        for candidate in candidates:
+            if candidate.get("name") == artifact_name:
+                return candidate
+        return None
+
+    def _reconcile_operation(
+        self,
+        *,
+        checkpoint: TextToMovieCheckpoint,
+        checkpoint_store: TextToMovieCheckpointStore,
+        operation,
+        media_type: str,
+        provider_supports_resume: bool,
+        scene_index: Optional[int] = None,
+    ):
+        durable = self._find_durable_artifact(operation, media_type)
+        decision = classify_generation_operation(
+            operation,
+            provider_supports_resume=provider_supports_resume,
+            durable_artifact_found=durable is not None,
+        )
+
+        if durable is not None:
+            try:
+                media = compact_media(durable)
+            except ValueError as exc:
+                raise TextToMovieExecutionError(
+                    stage="reconciliation",
+                    code="invalid_reconciled_artifact",
+                    message="A discovered durable artifact is invalid.",
+                    resumable=False,
+                    scene_index=scene_index,
+                    operation_id=operation.operation_id,
+                    reconciliation=safe_reconciliation_summary(decision),
+                ) from exc
+            record_persisted(operation, media)
+            checkpoint_store.save(checkpoint)
+            return media
+
+        if decision.action in {
+            ReconciliationAction.retry_submission,
+            ReconciliationAction.resume_provider,
+        }:
+            return None
+
+        raise TextToMovieExecutionError(
+            stage="reconciliation",
+            code=decision.reason_code,
+            message="Generation operation requires reconciliation before retry.",
+            resumable=False,
+            scene_index=scene_index,
+            operation_id=operation.operation_id,
+            reconciliation=safe_reconciliation_summary(decision),
+        )
+
     def _resume_or_generate_scenes(
         self,
         *,
@@ -504,6 +604,25 @@ class TextToMovieAgent(BaseAgent):
             if scene_checkpoint.status == "complete" and scene_checkpoint.media:
                 scene["video"] = scene_checkpoint.media
                 total_duration += float(scene_checkpoint.media.get("length", 0) or 0)
+                continue
+
+            supports_resume = callable(
+                getattr(self.video_gen_tool, "resume_text_to_video", None)
+            )
+            reconciled_media = self._reconcile_operation(
+                checkpoint=checkpoint,
+                checkpoint_store=checkpoint_store,
+                operation=operation,
+                media_type="video",
+                provider_supports_resume=supports_resume,
+                scene_index=index,
+            )
+            if reconciled_media is not None:
+                scene_checkpoint.media = reconciled_media
+                scene_checkpoint.status = "complete"
+                scene["video"] = reconciled_media
+                checkpoint_store.save(checkpoint)
+                total_duration += float(reconciled_media.get("length", 0) or 0)
                 continue
 
             self.output_message.actions.append(
@@ -574,6 +693,7 @@ class TextToMovieAgent(BaseAgent):
                             video_path,
                             source_type="file_path",
                             media_type="video",
+                            name=make_artifact_name(operation.operation_id, "video"),
                         )
                     except Exception as exc:
                         record_failure(
@@ -686,6 +806,19 @@ class TextToMovieAgent(BaseAgent):
                 message="Audio operation state is unavailable.",
             )
 
+        reconciled_media = self._reconcile_operation(
+            checkpoint=checkpoint,
+            checkpoint_store=checkpoint_store,
+            operation=operation,
+            media_type="audio",
+            provider_supports_resume=False,
+        )
+        if reconciled_media is not None:
+            checkpoint.audio_media = reconciled_media
+            checkpoint.status = "audio_complete"
+            checkpoint_store.save(checkpoint)
+            return reconciled_media
+
         if not checkpoint.audio_prompt:
             try:
                 checkpoint.audio_prompt = self.generate_audio_prompt(storyline)
@@ -735,6 +868,7 @@ class TextToMovieAgent(BaseAgent):
                         sound_effects_path,
                         source_type="file_path",
                         media_type="audio",
+                        name=make_artifact_name(operation.operation_id, "audio"),
                     )
                 except Exception as exc:
                     record_failure(operation, code="audio_upload_failed")
