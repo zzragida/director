@@ -11,6 +11,7 @@ from director.core.context_cas import atomic_update_context
 
 LEASE_CONTEXT_KEY = "__generation_operation_leases__"
 FENCE_CONTEXT_KEY = "__generation_fence_counters__"
+ACTIVE_LEASE_STATE_KEY = "__generation_active_fencing_lease__"
 LEASE_VERSION = 2
 DEFAULT_LEASE_TTL_SECONDS = 900
 MIN_LEASE_TTL_SECONDS = 30
@@ -93,6 +94,19 @@ def _write_json_document(context: Dict, key: str, document: Dict[str, object]) -
         }
     ]
     return context
+
+
+def get_active_fencing_lease(session) -> Optional[GenerationLease]:
+    state = getattr(session, "state", None)
+    if not isinstance(state, dict):
+        return None
+    raw = state.get(ACTIVE_LEASE_STATE_KEY)
+    if raw is None:
+        return None
+    try:
+        return GenerationLease.model_validate(raw)
+    except Exception:
+        return None
 
 
 def validate_fencing_lease_in_context(
@@ -179,8 +193,27 @@ class GenerationLeaseStore:
                 return int(current_epoch())
             except (AttributeError, NotImplementedError):
                 pass
-        # Compatibility fallback for non-production test doubles/backends.
         return int(time.time())
+
+    def _remember_active(self, lease: GenerationLease) -> None:
+        state = getattr(self.session, "state", None)
+        if isinstance(state, dict):
+            state[ACTIVE_LEASE_STATE_KEY] = lease.model_dump(mode="json")
+
+    def _forget_active(self, lease: GenerationLease) -> None:
+        state = getattr(self.session, "state", None)
+        if not isinstance(state, dict):
+            return
+        current = get_active_fencing_lease(self.session)
+        if current is None:
+            state.pop(ACTIVE_LEASE_STATE_KEY, None)
+            return
+        if (
+            current.operation_id == lease.operation_id
+            and current.fencing_token == lease.fencing_token
+            and current.lease_token == lease.lease_token
+        ):
+            state.pop(ACTIVE_LEASE_STATE_KEY, None)
 
     def get(self, operation_id: str) -> Optional[GenerationLease]:
         context = self.session.db.get_context_messages(self.session.session_id) or {}
@@ -279,6 +312,8 @@ class GenerationLeaseStore:
             mutate,
             max_attempts=self.max_cas_attempts,
         )
+        if result.acquired and result.lease is not None:
+            self._remember_active(result.lease)
         return result
 
     def assert_current(
@@ -332,6 +367,7 @@ class GenerationLeaseStore:
         )
         if refreshed is None:
             raise GenerationLeaseLostError(lost_reason or "lease_lost")
+        self._remember_active(refreshed)
         return refreshed
 
     def release(self, lease: GenerationLease) -> bool:
@@ -359,7 +395,6 @@ class GenerationLeaseStore:
                 return None
             document.pop(lease.operation_id, None)
             released = True
-            # Deliberately retain FENCE_CONTEXT_KEY so the next owner receives N+1.
             return self._write_document(context, document)
 
         atomic_update_context(
@@ -368,4 +403,6 @@ class GenerationLeaseStore:
             mutate,
             max_attempts=self.max_cas_attempts,
         )
+        if released:
+            self._forget_active(lease)
         return released
