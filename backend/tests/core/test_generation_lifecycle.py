@@ -1,4 +1,5 @@
 from director.core.generation_lifecycle import (
+    GenerationOperation,
     GenerationOperationState,
     begin_resume,
     begin_submission,
@@ -37,6 +38,9 @@ def test_operation_records_submission_provider_id_and_persistence():
     begin_submission(operation)
     assert operation.state == GenerationOperationState.submitting
     assert operation.attempt_count == 1
+    assert operation.submission_count == 1
+    assert operation.resume_count == 0
+    assert operation.accounting_known is True
 
     record_provider_request(operation, "task-123")
     assert operation.state == GenerationOperationState.submitted
@@ -53,7 +57,7 @@ def test_operation_records_submission_provider_id_and_persistence():
     assert operation.artifact["id"] == "video-1"
 
 
-def test_failed_submitted_operation_keeps_resume_token():
+def test_failed_submitted_operation_keeps_resume_token_without_new_submission():
     operation = create_operation(
         "genrun:test",
         kind="scene_video",
@@ -72,7 +76,54 @@ def test_failed_submitted_operation_keeps_resume_token():
     begin_resume(operation)
     assert operation.state == GenerationOperationState.submitted
     assert operation.attempt_count == 2
+    assert operation.submission_count == 1
+    assert operation.resume_count == 1
     assert operation.provider_request_id == "generation-77"
+
+
+def test_second_new_submission_is_counted_separately_from_resume():
+    operation = create_operation(
+        "genrun:test",
+        kind="scene_video",
+        provider="videodb",
+        index=0,
+    )
+    begin_submission(operation)
+    record_failure(operation, code="temporary_failure")
+    begin_submission(operation)
+
+    assert operation.attempt_count == 2
+    assert operation.submission_count == 2
+    assert operation.resume_count == 0
+
+
+def test_legacy_v2_operation_does_not_invent_historical_submission_split():
+    operation = GenerationOperation.model_validate(
+        {
+            "version": 2,
+            "operation_id": "genop:scene_video:0:legacy",
+            "kind": "scene_video",
+            "provider": "kling",
+            "state": "failed",
+            "attempt_count": 3,
+            "provider_request_id": None,
+            "artifact": None,
+            "last_error_code": "legacy_failure",
+            "recoverable": True,
+            "updated_at_epoch": 1000,
+        }
+    )
+
+    assert operation.submission_count is None
+    assert operation.resume_count is None
+    assert operation.accounting_known is False
+
+    begin_submission(operation)
+    assert operation.version == 3
+    assert operation.attempt_count == 4
+    assert operation.submission_count == 1
+    assert operation.resume_count == 0
+    assert operation.accounting_known is False
 
 
 def test_safe_summary_does_not_expose_provider_request_id():
@@ -88,5 +139,8 @@ def test_safe_summary_does_not_expose_provider_request_id():
     summary = safe_operation_summary(operation)
 
     assert summary["provider_request_known"] is True
+    assert summary["submission_count"] == 1
+    assert summary["resume_count"] == 0
+    assert summary["accounting_known"] is True
     assert "provider_request_id" not in summary
     assert "private-provider-task-id" not in str(summary)
