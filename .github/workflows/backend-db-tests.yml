@@ -8,6 +8,7 @@ on:
       - "backend/director/core/chat_request.py"
       - "backend/director/core/media_reference.py"
       - "backend/director/core/tool_contract.py"
+      - "backend/director/core/tool_semantics.py"
       - "backend/director/agents/base.py"
       - "backend/director/agents/summarize_video.py"
       - "backend/director/agents/upload.py"
@@ -28,6 +29,7 @@ on:
       - "backend/director/core/chat_request.py"
       - "backend/director/core/media_reference.py"
       - "backend/director/core/tool_contract.py"
+      - "backend/director/core/tool_semantics.py"
       - "backend/director/agents/base.py"
       - "backend/director/agents/summarize_video.py"
       - "backend/director/agents/upload.py"
@@ -74,6 +76,7 @@ jobs:
           backend/tests/core/test_chat_request_contract.py
           backend/tests/core/test_media_reference_contract.py
           backend/tests/core/test_tool_contract.py
+          backend/tests/core/test_tool_semantics.py
           backend/tests/agents/test_base_agent_tool_contract.py
           backend/tests/agents/test_agent_failure_contract.py
           backend/tests/handler/test_chat_agent_selection_contract.py

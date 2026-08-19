@@ -11,6 +11,10 @@ from director.core.tool_contract import (
     get_effective_tool_schema,
     validate_tool_arguments,
 )
+from director.core.tool_semantics import (
+    ToolSemanticValidationError,
+    validate_tool_semantics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +87,7 @@ class BaseAgent(ABC):
             # existing internal positional calls while validating the tool path.
             if not args:
                 validate_tool_arguments(self.effective_parameters(), kwargs)
+                validate_tool_semantics(self.session, self.agent_name, kwargs)
             return self.run(*args, **kwargs)
 
         except ToolArgumentValidationError as error:
@@ -90,6 +95,16 @@ class BaseAgent(ABC):
             return AgentResponse(
                 status=AgentStatus.ERROR,
                 message=f"Invalid arguments for {self.agent_name} agent.",
+                data={
+                    "error": error.code,
+                    "details": error.details,
+                },
+            )
+        except ToolSemanticValidationError as error:
+            logger.warning("Invalid semantics for %s agent", self.agent_name)
+            return AgentResponse(
+                status=AgentStatus.ERROR,
+                message=f"Invalid media context for {self.agent_name} agent.",
                 data={
                     "error": error.code,
                     "details": error.details,
