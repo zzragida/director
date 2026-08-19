@@ -5,13 +5,16 @@ on:
     paths:
       - "backend/director/db/**"
       - "backend/director/core/reasoning.py"
+      - "backend/director/core/chat_request.py"
       - "backend/director/agents/summarize_video.py"
       - "backend/director/agents/upload.py"
       - "backend/director/handler.py"
+      - "backend/director/entrypoint/api/socket_io.py"
       - "backend/tests/db/**"
       - "backend/tests/core/**"
       - "backend/tests/agents/**"
       - "backend/tests/handler/**"
+      - "backend/tests/entrypoint/**"
       - ".github/workflows/backend-db-tests.yml"
   push:
     branches:
@@ -19,13 +22,16 @@ on:
     paths:
       - "backend/director/db/**"
       - "backend/director/core/reasoning.py"
+      - "backend/director/core/chat_request.py"
       - "backend/director/agents/summarize_video.py"
       - "backend/director/agents/upload.py"
       - "backend/director/handler.py"
+      - "backend/director/entrypoint/api/socket_io.py"
       - "backend/tests/db/**"
       - "backend/tests/core/**"
       - "backend/tests/agents/**"
       - "backend/tests/handler/**"
+      - "backend/tests/entrypoint/**"
       - ".github/workflows/backend-db-tests.yml"
 
 permissions:
@@ -46,7 +52,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependencies
-        run: python -m pip install pytest==8.3.2 python-dotenv==1.0.1
+        run: >-
+          python -m pip install
+          pytest==8.3.2
+          python-dotenv==1.0.1
+          pydantic==2.8.2
 
       - name: Run backend contract tests
         env:
@@ -55,5 +65,7 @@ jobs:
           pytest -q
           backend/tests/db/test_session_delete_contract.py
           backend/tests/core/test_reasoning_outcome_contract.py
+          backend/tests/core/test_chat_request_contract.py
           backend/tests/agents/test_agent_failure_contract.py
           backend/tests/handler/test_chat_agent_selection_contract.py
+          backend/tests/entrypoint/test_chat_socket_contract.py
