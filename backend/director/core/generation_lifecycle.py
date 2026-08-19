@@ -22,16 +22,25 @@ class GenerationOperation(BaseModel):
     request ID. Provider request IDs enable resume/reconciliation when a
     provider exposes a fetch/poll API, but they are not proof of exactly-once
     submission.
+
+    ``attempt_count`` is retained for backwards compatibility and counts both
+    new provider submissions and provider resumes. Cost attribution must use
+    ``submission_count`` instead because a resume/poll is not necessarily a new
+    billable generation request. Legacy v2 checkpoints intentionally keep
+    ``accounting_complete=False`` rather than guessing their historical split.
     """
 
     model_config = ConfigDict(extra="forbid", use_enum_values=True)
 
-    version: int = 2
+    version: int = 3
     operation_id: str
     kind: str
     provider: str
     state: GenerationOperationState = GenerationOperationState.planned
     attempt_count: int = Field(default=0, ge=0)
+    submission_count: Optional[int] = Field(default=None, ge=0)
+    resume_count: Optional[int] = Field(default=None, ge=0)
+    accounting_complete: bool = False
     provider_request_id: Optional[str] = None
     artifact: Optional[Dict[str, Any]] = None
     last_error_code: Optional[str] = None
@@ -45,6 +54,14 @@ class GenerationOperation(BaseModel):
     @property
     def has_provider_resume_token(self) -> bool:
         return bool(self.provider_request_id) and not self.is_persisted
+
+    @property
+    def accounting_known(self) -> bool:
+        return bool(
+            self.accounting_complete
+            and self.submission_count is not None
+            and self.resume_count is not None
+        )
 
 
 def _now_epoch() -> int:
@@ -93,13 +110,32 @@ def create_operation(
         ),
         kind=kind,
         provider=provider,
+        submission_count=0,
+        resume_count=0,
+        accounting_complete=True,
     )
     touch_operation(operation)
     return operation
 
 
+def _ensure_v3_accounting(operation: GenerationOperation) -> None:
+    """Start exact counters from now without inventing legacy history."""
+
+    if operation.version < 3:
+        operation.version = 3
+    if operation.submission_count is None:
+        operation.submission_count = 0
+    if operation.resume_count is None:
+        operation.resume_count = 0
+    # Do not set accounting_complete here. A legacy operation can start exact
+    # counters from this call onward while its earlier attempt history remains
+    # unknowable.
+
+
 def begin_submission(operation: GenerationOperation) -> None:
+    _ensure_v3_accounting(operation)
     operation.attempt_count += 1
+    operation.submission_count += 1
     operation.state = GenerationOperationState.submitting
     operation.last_error_code = None
     operation.recoverable = True
@@ -107,7 +143,9 @@ def begin_submission(operation: GenerationOperation) -> None:
 
 
 def begin_resume(operation: GenerationOperation) -> None:
+    _ensure_v3_accounting(operation)
     operation.attempt_count += 1
+    operation.resume_count += 1
     operation.state = GenerationOperationState.submitted
     operation.last_error_code = None
     operation.recoverable = True
@@ -162,6 +200,9 @@ def safe_operation_summary(operation: Optional[GenerationOperation]) -> Dict[str
         "provider": operation.provider,
         "state": str(operation.state),
         "attempt_count": operation.attempt_count,
+        "submission_count": operation.submission_count,
+        "resume_count": operation.resume_count,
+        "accounting_known": operation.accounting_known,
         "provider_request_known": bool(operation.provider_request_id),
         "artifact_persisted": operation.is_persisted,
         "recoverable": operation.recoverable,
