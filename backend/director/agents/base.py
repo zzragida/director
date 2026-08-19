@@ -6,6 +6,10 @@ from pydantic import BaseModel
 from openai_function_calling import FunctionInferrer
 
 from director.core.session import Session, OutputMessage
+from director.core.tool_contract import (
+    ToolArgumentValidationError,
+    validate_tool_arguments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +74,22 @@ class BaseAgent(ABC):
 
     def safe_call(self, *args, **kwargs):
         try:
+            # LLM tool calls are keyword-based. Preserve compatibility with any
+            # existing internal positional calls while validating the tool path.
+            if not args:
+                validate_tool_arguments(self.parameters, kwargs)
             return self.run(*args, **kwargs)
 
+        except ToolArgumentValidationError as error:
+            logger.warning("Invalid arguments for %s agent", self.agent_name)
+            return AgentResponse(
+                status=AgentStatus.ERROR,
+                message=f"Invalid arguments for {self.agent_name} agent.",
+                data={
+                    "error": error.code,
+                    "details": error.details,
+                },
+            )
         except Exception as e:
             logger.exception(f"error in {self.agent_name} agent: {e}")
             return AgentResponse(status=AgentStatus.ERROR, message=str(e))
