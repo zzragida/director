@@ -13,7 +13,7 @@ from director.core.session import ContextMessage, RoleTypes
 
 
 CHECKPOINT_CONTEXT_KEY = "__text_to_movie_checkpoints__"
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 
 
 class TextToMovieExecutionError(RuntimeError):
@@ -28,6 +28,7 @@ class TextToMovieExecutionError(RuntimeError):
         scene_index: Optional[int] = None,
         resumable: bool = True,
         operation_id: Optional[str] = None,
+        reconciliation: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(message)
         self.stage = stage
@@ -36,6 +37,7 @@ class TextToMovieExecutionError(RuntimeError):
         self.scene_index = scene_index
         self.resumable = resumable
         self.operation_id = operation_id
+        self.reconciliation = reconciliation or None
 
 
 class SceneCheckpoint(BaseModel):
