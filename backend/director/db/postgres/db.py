@@ -196,19 +196,24 @@ class PostgresDB(BaseDB):
         return self.cursor.rowcount > 0
 
     def delete_session(self, session_id: str) -> bool:
-        failed_components = []
-        if not self.delete_conversation(session_id):
-            failed_components.append("conversation")
-        if not self.delete_context(session_id):
-            failed_components.append("context")
+        """Delete a session and any associated conversation/context rows.
+
+        Conversation and context rows are optional during the session lifecycle, so
+        their absence is not considered a deletion failure. The operation succeeds
+        only when the session row itself is deleted. Database errors still propagate.
+
+        :param str session_id: Unique session ID.
+        :return: Tuple of success flag and failed component names.
+        """
+        self.delete_conversation(session_id)
+        self.delete_context(session_id)
 
         self.cursor.execute("DELETE FROM sessions WHERE session_id = %s", (session_id,))
         self.conn.commit()
-        if not self.cursor.rowcount > 0:
-            failed_components.append("session")
 
-        success = len(failed_components) < 3
-        return success, failed_components
+        session_deleted = self.cursor.rowcount > 0
+        failed_components = [] if session_deleted else ["session"]
+        return session_deleted, failed_components
 
     def health_check(self) -> bool:
         try:

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import List, Tuple
 
 
 class BaseDB(ABC):
@@ -41,6 +42,18 @@ class BaseDB(ABC):
         self, session_id: str, context_messages: list
     ) -> None:
         """Update context messages for a session."""
+        pass
+
+    @abstractmethod
+    def delete_session(self, session_id: str) -> Tuple[bool, List[str]]:
+        """Delete a session and its optional associated data.
+
+        Return ``(True, [])`` only when the session row itself is deleted.
+        Missing optional conversation/context rows are not failures. If no
+        session row is deleted, return ``(False, ["session"])``. Database
+        errors should propagate to the caller instead of being converted into
+        a successful result.
+        """
         pass
 
     @abstractmethod
