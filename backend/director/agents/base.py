@@ -8,6 +8,7 @@ from openai_function_calling import FunctionInferrer
 from director.core.session import Session, OutputMessage
 from director.core.tool_contract import (
     ToolArgumentValidationError,
+    get_effective_tool_schema,
     validate_tool_arguments,
 )
 
@@ -56,12 +57,16 @@ class BaseAgent(ABC):
 
         return parameters
 
+    def effective_parameters(self):
+        """Return the contract advertised to the LLM and enforced at runtime."""
+        return get_effective_tool_schema(self.agent_name, self.parameters)
+
     def to_llm_format(self):
         """Convert the agent to LLM tool format."""
         return {
             "name": self.agent_name,
             "description": self.description,
-            "parameters": self.parameters,
+            "parameters": self.effective_parameters(),
         }
 
     @property
@@ -77,7 +82,7 @@ class BaseAgent(ABC):
             # LLM tool calls are keyword-based. Preserve compatibility with any
             # existing internal positional calls while validating the tool path.
             if not args:
-                validate_tool_arguments(self.parameters, kwargs)
+                validate_tool_arguments(self.effective_parameters(), kwargs)
             return self.run(*args, **kwargs)
 
         except ToolArgumentValidationError as error:
